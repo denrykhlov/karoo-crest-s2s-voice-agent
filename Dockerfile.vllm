@@ -1,0 +1,64 @@
+ARG BASE_IMAGE=vllm/vllm-openai:v0.33.0@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE
+ARG VLLM_OMNI_COMMIT=ca9398dc9f18b6536daa05fd1980e2e9d370ed4f
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5
+ARG VLLM_VERSION=0.33.0
+
+# Clear base image EFA NCCL override so Torch 2.14 CUDA 13 metadata resolves cleanly.
+ENV UV_OVERRIDE=""
+ENV VLLM_OMNI_TARGET_DEVICE="cuda"
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git jq curl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pin vllm-omni to the last commit supporting ModelRunner V1 + CUDA for LFM3-Omni-2B.
+RUN git init /opt/vllm-omni && \
+    git -C /opt/vllm-omni remote add origin https://github.com/vllm-project/vllm-omni.git && \
+    git -C /opt/vllm-omni fetch --depth 1 origin "${VLLM_OMNI_COMMIT}" && \
+    git -C /opt/vllm-omni checkout FETCH_HEAD
+
+# Apply upstream CUDA bootstrap repair; drop lmcache so we neither carry a Torch-2.13 ABI
+# binary nor spend 15+ minutes compiling it from source (LFM3 disables prefix caching).
+RUN python3 /opt/vllm-omni/tools/prepare_ci_telemetry.py "${BASE_IMAGE}" && \
+    uv pip uninstall --python "$(python3 -c 'import sys; print(sys.executable)')" \
+        opentelemetry-exporter-otlp-common lmcache && \
+    grep -v '^lmcache==' /opt/vllm-omni/requirements/cuda-bootstrap.txt > /tmp/cuda-bootstrap-no-lmcache.txt
+
+RUN cd /opt/vllm-omni && \
+    uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir \
+        -r /tmp/cuda-bootstrap-no-lmcache.txt \
+        "nvidia-nccl-cu13==2.30.7" \
+        "vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm-${VLLM_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl" \
+        "." && \
+    rm -f /tmp/cuda-bootstrap-no-lmcache.txt
+
+# Load verified cuDNN 9.25.1 private runtime matching upstream vllm-omni CUDA CI.
+RUN uv pip install --target /opt/vllm-omni-cudnn --no-deps --only-binary=:all: \
+    --require-hashes -r /opt/vllm-omni/requirements/cudnn-runtime.txt
+ENV LD_PRELOAD="/opt/vllm-omni-cudnn/nvidia/cudnn/lib/libcudnn.so.9 ${LD_PRELOAD:-}"
+ENV LD_LIBRARY_PATH="/opt/vllm-omni-cudnn/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-/usr/local/nvidia/lib:/usr/local/nvidia/lib64}"
+
+# Verify frozen vLLM commit + Call Studio web runtime deps without disturbing torch/vllm.
+RUN python3 -c "from vllm._version import __commit_id__, __version__; commit = (__commit_id__ or '').removeprefix('g'); assert len(commit) >= 8 and '${VLLM_PRECOMPILED_WHEEL_COMMIT}'.startswith(commit), __commit_id__; assert __version__ == '${VLLM_VERSION}', __version__" && \
+    uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir \
+        "httpx>=0.28.0" "uvicorn[standard]" "websockets" && \
+    uv pip check --python "$(python3 -c 'import sys; print(sys.executable)')" && \
+    ln -sf /usr/bin/python3 /usr/bin/python
+
+COPY telesales_agent.py /app/telesales_agent.py
+COPY voice_agent /app/voice_agent
+COPY deploy /app/deploy
+RUN chmod +x /app/deploy/start_runpod.sh
+
+# Build-time smoke verification: LFM3-Omni + vLLM backend import cleanly with zero MLX imports.
+RUN python3 -c "import sys; from vllm_omni.model_executor.models.lfm3_omni.model import Lfm3OmniForConditionalGeneration; from voice_agent.vllm_backend import VllmOmniEngine; assert 'mlx' not in sys.modules; print('OK:', Lfm3OmniForConditionalGeneration.__name__, VllmOmniEngine.__name__)"
+
+EXPOSE 8000
+ENTRYPOINT []
+CMD ["/app/deploy/start_runpod.sh"]

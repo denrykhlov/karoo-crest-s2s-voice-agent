@@ -1,0 +1,26 @@
+[project]
+name = "lfm3-voice-agent"
+version = "0.1.0"
+description = "Local macOS speech-to-speech voice agent powered by LiquidAI/LFM3-Omni-2B on MLX"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx-vlm==0.8.0",
+    "soundfile>=0.12.1",
+    "httpx>=0.28.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["voice_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

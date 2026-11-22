@@ -1,0 +1,14 @@
+.git/
+.github/
+calls/
+.venv/
+.pytest_cache/
+tests/
+__pycache__/
+*.pyc
+*.pyo
+*.wav
+.DS_Store
+.env
+.env.*
+*.md

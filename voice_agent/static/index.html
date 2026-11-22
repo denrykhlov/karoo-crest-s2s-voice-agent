@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Karoo Crest Bank — Pure-S2S Voice Call Studio</title>
+  <link rel="stylesheet" href="/static/style.css?v=20261122-5" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Bar -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">KC</div>
+        <div>
+          <h1 id="company-name">Karoo Crest Bank</h1>
+          <p id="app-subtitle" class="subtitle">Loading configuration…</p>
+        </div>
+      </div>
+      <div class="header-badges">
+        <div id="badge-list" class="badge-list"></div>
+        <span id="pipeline-pill" class="status-pill pure-s2s">Pure S2S · B=2 MLX</span>
+        <span id="flametree-pill" class="status-pill muted">Flametree: Checking…</span>
+        <span id="model-pill" class="status-pill">LFM3-Omni-2B · MLX</span>
+        <span id="conn-pill" class="status-pill muted">Disconnected</span>
+      </div>
+    </header>
+
+    <!-- Main 2-Column Workspace -->
+    <main class="studio-grid">
+      <!-- Left Column: Phone Console -->
+      <section class="panel phone-panel">
+        <div class="phone-header">
+          <div>
+            <span class="eyebrow">Active Representative</span>
+            <h2 id="active-persona-name">Naledi Mokoena</h2>
+            <p id="active-persona-role" class="persona-role">Credit Card Specialist</p>
+          </div>
+          <div class="timer-block">
+            <span class="eyebrow">Call Budget (5 min)</span>
+            <span id="call-timer" class="call-timer">00:00 / 05:00</span>
+            <div id="call-id-readout" class="context-sub">Call ID: —</div>
+          </div>
+        </div>
+
+        <!-- Animated Voice Orb -->
+        <div class="orb-stage">
+          <canvas id="orb-canvas" width="280" height="280"></canvas>
+          <div class="orb-overlay">
+            <span id="call-state-label" class="call-state-label">Ready to Dial</span>
+            <span id="s2s-indicator" class="vad-indicator">S2S stream idle</span>
+          </div>
+        </div>
+
+        <!-- Telemetry Strip -->
+        <div class="telemetry-row telemetry-row-4">
+          <div class="tele-chip">
+            <span class="tele-label">Perceived TTFA</span>
+            <span id="tele-ttfa-perceived" class="tele-value">—</span>
+          </div>
+          <div class="tele-chip">
+            <span class="tele-label">Server TTFA</span>
+            <span id="tele-ttfa" class="tele-value">—</span>
+          </div>
+          <div class="tele-chip">
+            <span class="tele-label">Barge-in TTFA</span>
+            <span id="tele-barge-ttfa" class="tele-value">—</span>
+          </div>
+          <div class="tele-chip">
+            <span class="tele-label">Speed / RTF</span>
+            <span id="tele-speed" class="tele-value">—</span>
+          </div>
+        </div>
+
+        <!-- 5-Minute Call Context & Compaction Monitor -->
+        <div class="context-meter">
+          <div class="context-meter-head">
+            <span>Context &amp; Compaction</span>
+            <span id="ctx-readout">0 / 32K · 0 compactions</span>
+          </div>
+          <div class="context-bar-track">
+            <div id="ctx-bar-fill" class="context-bar-fill" style="width: 0%"></div>
+          </div>
+          <div id="listener-readout" class="context-sub">
+            LiveS2S Listener window: 0.0s / 30.0s (0 rollovers)
+          </div>
+        </div>
+
+        <!-- Primary Call Controls -->
+        <div class="controls-bar">
+          <button id="btn-call" class="btn btn-call" type="button">
+            Start Call
+          </button>
+          <button id="btn-mute" class="btn btn-secondary" type="button" disabled>
+            Mute Mic
+          </button>
+          <button id="btn-mode" class="btn btn-secondary" type="button">
+            Mode: Live S2S
+          </button>
+        </div>
+
+        <button id="btn-ptt" class="btn btn-ptt hidden" type="button" disabled>
+          Hold to Talk (or hold Spacebar)
+        </button>
+
+        <!-- Call Settings -->
+        <div class="settings-box">
+          <h3>Multilingual S2S &amp; Delegation Settings</h3>
+          <div class="setting-row">
+            <label for="select-language">Call Language</label>
+            <select id="select-language">
+              <option value="es-MX">Español (México) · es-MX</option>
+              <option value="es">Español · es</option>
+              <option value="en" selected>English · en</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <label for="select-delegation-mode">Knowledge Delegation</label>
+            <select id="select-delegation-mode">
+              <option value="selective_tool" selected>Selective (B=2 Router + Flametree)</option>
+              <option value="always_delegate">Always Delegate to Flametree</option>
+            </select>
+          </div>
+          <div class="setting-row checkbox-row">
+            <label for="chk-filler">Parallel Voice Fillers (MLX B=2)</label>
+            <input id="chk-filler" type="checkbox" checked />
+          </div>
+          <div class="setting-row">
+            <label for="select-persona">Voice Persona</label>
+            <select id="select-persona"></select>
+          </div>
+          <div class="setting-row">
+            <label for="select-patience">Turn-End Patience (Model-Driven)</label>
+            <select id="select-patience">
+              <option value="snappy">Snappy (480ms half-stride / ~0.96s)</option>
+              <option value="balanced" selected>Balanced (semantic + 480ms probe)</option>
+              <option value="patient">Patient (2–3 quiet blocks)</option>
+            </select>
+          </div>
+          <div class="setting-row checkbox-row">
+            <label for="chk-tools">Enable Live CRM Tools</label>
+            <input id="chk-tools" type="checkbox" checked />
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Transcript, CRM & Speech Delivery Stats -->
+      <section class="panel workspace-panel">
+        <div class="panel-tabs">
+          <button class="tab-btn active" data-tab="transcript" type="button">
+            Live Transcript
+          </button>
+          <button class="tab-btn" data-tab="stats" type="button">
+            Delivery Stats <span id="stats-badge" class="tab-count hidden">0</span>
+          </button>
+          <button class="tab-btn" data-tab="crm" type="button">
+            CRM &amp; Card Tariffs <span id="crm-badge" class="tab-count hidden">0</span>
+          </button>
+          <div class="tab-spacer"></div>
+          <button id="btn-export" class="btn btn-ghost" type="button">
+            Download Transcript
+          </button>
+        </div>
+
+        <!-- Tab 1: Live Transcript -->
+        <div id="tab-transcript" class="tab-pane active">
+          <div id="transcript-feed" class="transcript-feed">
+            <div class="empty-state">
+              Select language (<strong>es-MX</strong>, <strong>es</strong>, or <strong>en</strong>) and delegation mode, then click <strong>Start Call</strong> to stream continuous 16 kHz microphone audio directly into <strong>LFM3-Omni-2B</strong> (Frame-1 streamed playback + MLX B=2 parallel voice fillers &amp; Flametree delegation).
+            </div>
+          </div>
+
+          <form id="text-form" class="text-composer">
+            <input
+              id="text-input"
+              type="text"
+              placeholder="Optional text fallback — type a message in es-MX / es / en and press Enter…"
+              autocomplete="off"
+            />
+            <button id="btn-send-text" class="btn btn-primary" type="submit">Send</button>
+          </form>
+        </div>
+
+        <!-- Tab 2: Speech Delivery Statistics & Delegation Trace -->
+        <div id="tab-stats" class="tab-pane">
+          <div class="crm-scroll">
+            <div class="stats-toolbar">
+              <div>
+                <h4 style="margin: 0">Speech Delivery &amp; Streaming Telemetry</h4>
+                <span id="stats-meta-sub" class="context-sub">Frame-1 chunk streaming · 40 ms worklet prebuffer</span>
+              </div>
+              <button id="btn-export-metrics" class="btn btn-ghost" type="button">
+                Export Metrics JSON
+              </button>
+            </div>
+
+            <div class="kpi-grid">
+              <div class="kpi-card">
+                <span class="kpi-label">Perceived TTFA (Browser)</span>
+                <span id="kpi-perceived" class="kpi-main">—</span>
+                <span id="kpi-perceived-sub" class="kpi-sub">p50 — · p95 —</span>
+              </div>
+              <div class="kpi-card">
+                <span class="kpi-label">Server First Audio (Chunk 1)</span>
+                <span id="kpi-server-ttfa" class="kpi-main">—</span>
+                <span id="kpi-server-ttfa-sub" class="kpi-sub">p50 — · p95 —</span>
+              </div>
+              <div class="kpi-card">
+                <span class="kpi-label">Time to First Token (TTFT)</span>
+                <span id="kpi-ttft" class="kpi-main">—</span>
+                <span id="kpi-ttft-sub" class="kpi-sub">p50 — · p95 —</span>
+              </div>
+              <div class="kpi-card">
+                <span class="kpi-label">Post-Barge-In TTFA</span>
+                <span id="kpi-barge" class="kpi-main">—</span>
+                <span id="kpi-barge-sub" class="kpi-sub">Cancel avg — · count 0</span>
+              </div>
+              <div class="kpi-card">
+                <span class="kpi-label">S2S Endpointing Delay</span>
+                <span id="kpi-endpoint" class="kpi-main">—</span>
+                <span id="kpi-endpoint-sub" class="kpi-sub">p50 — · p95 —</span>
+              </div>
+              <div class="kpi-card">
+                <span class="kpi-label">Dynamic B=2 Filler TTFA</span>
+                <span id="kpi-filler" class="kpi-main">—</span>
+                <span id="kpi-filler-sub" class="kpi-sub">p50 — · p95 —</span>
+              </div>
+              <div class="kpi-card">
+                <span class="kpi-label">Flametree Delegation RTT</span>
+                <span id="kpi-delegation" class="kpi-main">—</span>
+                <span id="kpi-delegation-sub" class="kpi-sub">p50 — · p95 —</span>
+              </div>
+              <div class="kpi-card">
+                <span class="kpi-label">Streaming RTF &amp; Codec</span>
+                <span id="kpi-rtf" class="kpi-main">—</span>
+                <span id="kpi-rtf-sub" class="kpi-sub">Codec chunk avg —</span>
+              </div>
+            </div>
+
+            <div class="crm-section">
+              <h4>Per-Turn Delivery Breakdown</h4>
+              <div class="table-wrap">
+                <table class="stats-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Lang</th>
+                      <th>Route</th>
+                      <th>Chunks</th>
+                      <th>Endpt</th>
+                      <th>TTFT</th>
+                      <th>Srv TTFA</th>
+                      <th>Perc TTFA</th>
+                      <th>Deleg</th>
+                      <th>RTF</th>
+                    </tr>
+                  </thead>
+                  <tbody id="stats-turns-body">
+                    <tr>
+                      <td colspan="10" class="muted">No turns recorded yet.</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="crm-section">
+              <h4>Flametree Delegation Trace <span id="flametree-portal-wrap"></span></h4>
+              <div id="delegation-log" class="tool-log muted">
+                Knowledge delegation queries extracted in parallel via MLX B=2 appear here.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 3: Live CRM & Product Reference -->
+        <div id="tab-crm" class="tab-pane">
+          <div class="crm-scroll">
+            <div class="crm-cards-grid">
+              <div class="crm-card">
+                <div class="crm-card-header">
+                  <span class="crm-card-title">Pre-Qualification</span>
+                  <span id="crm-qual-status" class="crm-tag">Pending</span>
+                </div>
+                <div id="crm-qual-body" class="crm-card-body muted">
+                  No pre-qualification check run yet.
+                </div>
+              </div>
+
+              <div class="crm-card">
+                <div class="crm-card-header">
+                  <span class="crm-card-title">Repayment Estimate</span>
+                  <span id="crm-calc-status" class="crm-tag">Pending</span>
+                </div>
+                <div id="crm-calc-body" class="crm-card-body muted">
+                  No repayment quote calculated yet.
+                </div>
+              </div>
+
+              <div class="crm-card">
+                <div class="crm-card-header">
+                  <span class="crm-card-title">Provisional Application</span>
+                  <span id="crm-app-status" class="crm-tag">Pending</span>
+                </div>
+                <div id="crm-app-body" class="crm-card-body muted">
+                  POPIA consent &amp; provisional FICA application not submitted.
+                </div>
+              </div>
+
+              <div class="crm-card">
+                <div class="crm-card-header">
+                  <span class="crm-card-title">Callback Booking</span>
+                  <span id="crm-cb-status" class="crm-tag">None</span>
+                </div>
+                <div id="crm-cb-body" class="crm-card-body muted">
+                  No follow-up callback scheduled.
+                </div>
+              </div>
+            </div>
+
+            <div class="crm-section">
+              <h4>Tool Execution Log</h4>
+              <div id="tool-log" class="tool-log muted">
+                Tool calls executed by LFM3-Omni-2B during the call appear here live.
+              </div>
+            </div>
+
+            <details class="product-sheet" open>
+              <summary id="product-sheet-title">Ubuntu Rewards Credit Card — Tariff Sheet</summary>
+              <p id="product-compliance-note" class="compliance-note"></p>
+              <div id="product-tiers" class="tiers-grid"></div>
+            </details>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js?v=20261122-5"></script>
+</body>
+</html>

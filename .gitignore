@@ -1,0 +1,17 @@
+# Per-call audio, traces, transcripts, and metrics (may contain user audio/PII)
+calls/
+
+# Local environment, secrets, caches, build artifacts
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.wav
+*.log
+.DS_Store
+.env
+.env.*
+dist/
+build/
+*.egg-info/
