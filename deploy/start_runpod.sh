@@ -39,13 +39,30 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT
 
-echo "[start_runpod] Launching vLLM-Omni on 127.0.0.1:${VLLM_PORT}"
-echo "[start_runpod] Model: ${MODEL_ID} @ ${MODEL_REVISION} | HF_HOME=${HF_HOME}"
+export MODEL_ID MODEL_REVISION
+echo "[start_runpod] Ensuring complete HuggingFace snapshot for ${MODEL_ID} @ ${MODEL_REVISION} (HF_HOME=${HF_HOME})..."
+python3 -c '
+import os
+from huggingface_hub import snapshot_download
+path = snapshot_download(
+    repo_id=os.environ["MODEL_ID"],
+    revision=os.environ["MODEL_REVISION"],
+)
+with open("/tmp/model_local_dir.txt", "w", encoding="utf-8") as fh:
+    fh.write(path)
+'
+MODEL_LOCAL_DIR="$(cat /tmp/model_local_dir.txt)"
+echo "[start_runpod] Snapshot ready at ${MODEL_LOCAL_DIR}"
+test -f "${MODEL_LOCAL_DIR}/model.safetensors"
+test -f "${MODEL_LOCAL_DIR}/audio_tokenizer/model.safetensors"
 
-vllm serve "${MODEL_ID}" \
+echo "[start_runpod] Launching vLLM-Omni on 127.0.0.1:${VLLM_PORT}"
+echo "[start_runpod] Served model: ${MODEL_ID} <- ${MODEL_LOCAL_DIR}"
+
+vllm serve "${MODEL_LOCAL_DIR}" \
+    --served-model-name "${MODEL_ID}" \
     --omni \
     --trust-remote-code \
-    --revision "${MODEL_REVISION}" \
     --deploy-config "${DEPLOY_CONFIG}" \
     --async-chunk \
     --limit-mm-per-prompt '{"audio":8}' \
