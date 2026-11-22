@@ -112,6 +112,15 @@ class MockVllmOmniRouter:
             sys_content = str((messages[0] if messages else {}).get("content") or "")
 
             if sys_content == "Perform live ASR.":
+                assert len(messages) == 2
+                asst_msg = messages[1]
+                assert asst_msg.get("role") == "assistant"
+                asst_content = asst_msg.get("content") or []
+                assert len(asst_content) == 2
+                assert asst_content[0].get("type") == "audio_url"
+                assert asst_content[1] == {"type": "text", "text": ""}
+                assert body.get("continue_final_message") is True
+                assert body.get("add_generation_prompt") is False
                 with self.lock:
                     if self.asr_idx < len(self.asr_sequence):
                         text = self.asr_sequence[self.asr_idx]
@@ -121,6 +130,15 @@ class MockVllmOmniRouter:
                 return httpx.Response(
                     200,
                     json={"choices": [{"message": {"role": "assistant", "content": text}}]},
+                )
+
+            if sys_content.startswith("Perform ASR in "):
+                assert len(messages) == 2
+                assert messages[1].get("role") == "user"
+                assert (messages[1].get("content") or [{}])[0].get("type") == "audio_url"
+                return httpx.Response(
+                    200,
+                    json={"choices": [{"message": {"role": "assistant", "content": "Hello Ubuntu Gold."}}]},
                 )
 
             if "Output strictly" in sys_content:
@@ -318,12 +336,13 @@ def test_vllm_live_s2s_listener_diff_echo_endpoint_and_barge_in() -> None:
         assert evs_echo == []
         assert not sess.user_speaking
 
-        # 2. Genuine barge-in speech while agent speaking triggers barge_in_detected + user_speech_start
+        # 2. Genuine barge-in speech while agent speaking + overlap deduplication + commit reset
         router.asr_idx = 0
         router.asr_sequence = [
-            "Naledi from Karoo Crest Wait tell",
-            "Naledi from Karoo Crest Wait tell me the fee",
-            "Naledi from Karoo Crest Wait tell me the fee",
+            "Good",
+            "Good morning.",
+            "morning.",  # trailing overlap only -> treated as empty delta for endpointing
+            "",
         ]
         evs_bi = sess.ingest_pcm_and_listen(
             block,
@@ -334,19 +353,25 @@ def test_vllm_live_s2s_listener_diff_echo_endpoint_and_barge_in() -> None:
         assert [e["type"] for e in evs_bi] == ["barge_in_detected", "user_speech_start"]
         assert sess.user_speaking
 
-        # 3. Incremental delta followed by silent empty chunks commits the user turn
+        # 3. Overlap deduplication avoids duplicate "Good"
         evs_delta = sess.ingest_pcm_and_listen(block, patience="snappy")
         assert evs_delta and evs_delta[0]["type"] == "user_speech_delta"
+        assert evs_delta[0]["text"] == "Good morning."
 
-        committed: list[dict[str, Any]] = []
-        for _ in range(3):
-            committed.extend(sess.ingest_pcm_and_listen(block, patience="snappy"))
-        assert any(e["type"] == "user_turn_committed" for e in committed)
+        resets_before_commit = sess.listener.reset_count
+        evs_commit = sess.ingest_pcm_and_listen(block, patience="snappy")
+        assert any(e["type"] == "user_turn_committed" for e in evs_commit)
         assert not sess.user_speaking
-        assert "fee" in sess.latest_user_text().lower()
+        assert sess.latest_user_text() == "Good morning."
+        # Commit must reset the sliding window so no tail bleeds into the next idle period
+        assert sess.listener.reset_count == resets_before_commit + 1
+        assert sess.listener._prev_tail_pcm == b""
+        assert sess.listener._prev_chunk_text == ""
 
-        # 4. Listener reset works cleanly
-        sess.listener.reset_window()
+        # 4. Listener PTT uses turn-based `Perform ASR in <lang>.` and resets cleanly
+        ptt_evs = sess.flush_ptt_audio(block)
+        assert [e["type"] for e in ptt_evs] == ["user_speech_start", "user_turn_committed"]
+        assert ptt_evs[1]["text"] == "Hello Ubuntu Gold."
         assert sess.listener.window_seconds == 0.0
     finally:
         engine.shutdown()
@@ -621,6 +646,7 @@ def test_vllm_websocket_full_call_metrics_and_recorder(
                 live_ttfts: list[dict[str, Any]] = []
                 live_ttfas: list[dict[str, Any]] = []
                 turn_ends: list[dict[str, Any]] = []
+                turn_event_order: dict[str, list[str]] = {}
                 audio_bytes_total = 0
 
                 for _ in range(200):
@@ -630,6 +656,9 @@ def test_vllm_websocket_full_call_metrics_and_recorder(
                     elif msg.get("text") is not None:
                         ev = json.loads(msg["text"])
                         t = ev.get("type")
+                        tid = ev.get("turn_id")
+                        if tid and t in ("assistant_turn_start", "live_ttft", "live_ttfa", "assistant_turn_end"):
+                            turn_event_order.setdefault(tid, []).append(t)
                         if t == "call_started":
                             call_id = ev["call_id"]
                         elif t == "live_ttft":
@@ -652,6 +681,9 @@ def test_vllm_websocket_full_call_metrics_and_recorder(
                     elif msg.get("text") is not None:
                         ev = json.loads(msg["text"])
                         t = ev.get("type")
+                        tid = ev.get("turn_id")
+                        if tid and t in ("assistant_turn_start", "live_ttft", "live_ttfa", "assistant_turn_end"):
+                            turn_event_order.setdefault(tid, []).append(t)
                         if t == "live_ttft":
                             live_ttfts.append(ev)
                         elif t == "live_ttfa":
@@ -673,6 +705,10 @@ def test_vllm_websocket_full_call_metrics_and_recorder(
             assert len(live_ttfas) >= 2
             assert len(turn_ends) >= 2
             for tev in turn_ends:
+                tid = tev["turn_id"]
+                order = turn_event_order[tid]
+                assert "assistant_turn_start" in order and "live_ttft" in order
+                assert order.index("assistant_turn_start") < order.index("live_ttft")
                 assert isinstance(tev.get("metrics"), dict)
                 assert tev["metrics"]["ttft_ms"] is not None
                 assert tev["metrics"]["ttfa_server_ms"] is not None

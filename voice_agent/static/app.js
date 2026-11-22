@@ -19,6 +19,7 @@
     micRms: 0,
     agentRms: 0,
     turns: new Map(),
+    pendingMetrics: new Map(),
     transcriptLog: [],
     delegationLog: [],
     latestDeliveryStats: null,
@@ -685,6 +686,7 @@
       els.callIdReadout.title = "";
     }
     state.turns.clear();
+    state.pendingMetrics.clear();
     state.transcriptLog = [];
     state.delegationLog = [];
     els.transcriptFeed.innerHTML = "";
@@ -826,6 +828,11 @@
     };
     state.turns.set(turnId, record);
     state.transcriptLog.push(record);
+    if (role === "assistant" && state.pendingMetrics.has(turnId)) {
+      const earlyPatch = state.pendingMetrics.get(turnId);
+      state.pendingMetrics.delete(turnId);
+      updateTranscriptMetrics(turnId, earlyPatch);
+    }
   }
 
   function formatTranscriptMetricsList(m) {
@@ -840,8 +847,16 @@
   }
 
   function updateTranscriptMetrics(turnId, patch) {
+    if (!turnId || !patch) return;
     const entry = state.turns.get(turnId);
-    if (!entry || !patch) return;
+    if (!entry) {
+      const prev = state.pendingMetrics.get(turnId) || {};
+      Object.entries(patch).forEach(([k, v]) => {
+        if (v != null) prev[k] = v;
+      });
+      state.pendingMetrics.set(turnId, prev);
+      return;
+    }
     Object.entries(patch).forEach(([k, v]) => {
       if (v != null) entry.metrics[k] = v;
     });

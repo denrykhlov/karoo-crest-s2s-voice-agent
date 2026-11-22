@@ -1070,6 +1070,15 @@ class CallSession:
                     if on_delegation_query is not None:
                         on_delegation_query(q_text)
                 elif ev_type == "text_delta":
+                    if not stream_state["turn_started_ui"]:
+                        stream_state["turn_started_ui"] = True
+                        await self._send_json(
+                            {
+                                "type": "assistant_turn_start",
+                                "turn_id": turn_id,
+                                "persona_name": self.persona.name,
+                            }
+                        )
                     if stream_state.get("first_token_ts") is None:
                         now_tok = time.perf_counter()
                         stream_state["first_token_ts"] = now_tok
@@ -1085,15 +1094,6 @@ class CallSession:
                                 "type": "live_ttft",
                                 "turn_id": turn_id,
                                 "ttft_ms": live_ttft_ms,
-                            }
-                        )
-                    if not stream_state["turn_started_ui"]:
-                        stream_state["turn_started_ui"] = True
-                        await self._send_json(
-                            {
-                                "type": "assistant_turn_start",
-                                "turn_id": turn_id,
-                                "persona_name": self.persona.name,
                             }
                         )
                     seg = ev.get("segment", "answer")

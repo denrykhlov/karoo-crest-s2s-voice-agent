@@ -43,30 +43,35 @@ def _parse_router_query(raw_router_text: str, fallback_text: str) -> tuple[str, 
     return "direct", ""
 
 
-def _diff_cumulative_asr(prev_full: str, new_full: str) -> str:
-    """Compute incremental speech text between two cumulative LiveASR window outputs."""
-    prev_clean = (prev_full or "").strip()
-    new_clean = (new_full or "").strip()
+def _norm_word(tok: str) -> str:
+    return tok.strip(".,!?;:\"'`()[]{}¿¡").lower()
+
+
+def _dedup_overlap_delta(prev_text: str, new_text: str) -> str:
+    """Strip overlapping prefix words from consecutive 1.28 s sliding ASR windows."""
+    prev_clean = (prev_text or "").strip()
+    new_clean = (new_text or "").strip()
     if not new_clean:
         return ""
     if not prev_clean:
         return new_clean
-    if new_clean.startswith(prev_clean):
-        return new_clean[len(prev_clean) :].strip()
 
-    prev_words = prev_clean.split()
-    new_words = new_clean.split()
-    common = 0
-    for pw, nw in zip(prev_words, new_words):
-        if pw.lower() == nw.lower():
-            common += 1
-        else:
+    prev_words = [_norm_word(w) for w in prev_clean.split() if _norm_word(w)]
+    orig_new_words = new_clean.split()
+    norm_new_words = [_norm_word(w) for w in orig_new_words]
+    if not prev_words or not norm_new_words:
+        return new_clean
+
+    max_k = min(len(prev_words), len(norm_new_words), 6)
+    overlap_k = 0
+    for k in range(max_k, 0, -1):
+        if prev_words[-k:] == norm_new_words[:k]:
+            overlap_k = k
             break
-    if common > 0:
-        return " ".join(new_words[common:]).strip()
-    if len(new_clean) <= len(prev_clean):
+
+    if overlap_k >= len(orig_new_words):
         return ""
-    return new_clean
+    return " ".join(orig_new_words[overlap_k:]).strip()
 
 
 class VllmLiveS2SListener:
@@ -79,57 +84,69 @@ class VllmLiveS2SListener:
         idle_reset_sec: float = 15.0,
         hard_reset_sec: float = 30.0,
         block_bytes: int = 20480,  # 640 ms @ 16 kHz mono Int16
+        overlap_bytes: int = 20480,  # 640 ms left overlap (1.28 s O(1) window)
     ) -> None:
         self._client_factory = client_factory
         self.model_id = model_id
         self.idle_reset_sec = float(idle_reset_sec)
         self.hard_reset_sec = float(hard_reset_sec)
         self.block_bytes = int(block_bytes)
+        self.overlap_bytes = int(overlap_bytes)
 
-        self._rolling_pcm = bytearray()
-        self._prev_rolling_text: str = ""
+        self._prev_tail_pcm: bytes = b""
+        self._prev_chunk_text: str = ""
+        self._active_sec: float = 0.0
         self._idle_sec: float = 0.0
         self.reset_count: int = 0
 
     @property
     def window_seconds(self) -> float:
-        return round(len(self._rolling_pcm) / 32000.0, 2)
+        return round(self._active_sec, 2)
 
     def reset_window(self) -> None:
-        self._rolling_pcm.clear()
-        self._prev_rolling_text = ""
+        self._prev_tail_pcm = b""
+        self._prev_chunk_text = ""
+        self._active_sec = 0.0
         self._idle_sec = 0.0
         self.reset_count += 1
 
     def step_block(self, pcm16_block: bytes) -> str:
-        """Transcribe cumulative listener window via vLLM-Omni and return new delta text."""
+        """Transcribe a bounded O(1) sliding window via native assistant-turn LiveASR."""
         if not pcm16_block:
             return ""
-        self._rolling_pcm.extend(pcm16_block)
-        wav_bytes = pcm16_to_wav_bytes(bytes(self._rolling_pcm), sample_rate=16000)
+        window_pcm = self._prev_tail_pcm + pcm16_block
+        self._prev_tail_pcm = (
+            pcm16_block[-self.overlap_bytes :] if self.overlap_bytes > 0 else b""
+        )
+        wav_bytes = pcm16_to_wav_bytes(window_pcm, sample_rate=16000)
         b64_wav = base64.b64encode(wav_bytes).decode("ascii")
+        # Native assistant-turn `Perform live ASR.` emits `<|text_end|>`/`<|im_end|>` on silence;
+        # trailing empty text block satisfies `continue_final_message=True` in Jinja templates.
         payload = {
             "model": self.model_id,
             "messages": [
                 {"role": "system", "content": "Perform live ASR."},
                 {
-                    "role": "user",
+                    "role": "assistant",
                     "content": [
                         {
                             "type": "audio_url",
                             "audio_url": {"url": f"data:audio/wav;base64,{b64_wav}"},
-                        }
+                        },
+                        {"type": "text", "text": ""},
                     ],
                 },
             ],
+            "add_generation_prompt": False,
+            "continue_final_message": True,
             "modalities": ["text"],
             "temperature": 0.0,
-            "max_tokens": 128,
+            "max_tokens": 48,
             "stream": False,
             "sampling_params_list": [
                 {
                     "temperature": 0.0,
-                    "max_tokens": 128,
+                    "max_tokens": 48,
                     "extra_args": {"generation_mode": "text"},
                 }
             ],
@@ -141,19 +158,27 @@ class VllmLiveS2SListener:
 
         msg = ((data.get("choices") or [{}])[0].get("message") or {})
         raw_text = clean_display_text(str(msg.get("content") or ""))
-        delta = _diff_cumulative_asr(self._prev_rolling_text, raw_text)
-        if len(raw_text) >= len(self._prev_rolling_text):
-            self._prev_rolling_text = raw_text
+        block_dur_sec = len(pcm16_block) / 32000.0
+        if not has_real_speech(raw_text):
+            self._prev_chunk_text = ""
+            self._idle_sec += block_dur_sec
+            return ""
+
+        delta = _dedup_overlap_delta(self._prev_chunk_text, raw_text)
+        self._prev_chunk_text = raw_text
+        self._active_sec = min(self.hard_reset_sec, self._active_sec + block_dur_sec)
         if has_real_speech(delta):
             self._idle_sec = 0.0
         else:
-            self._idle_sec += len(pcm16_block) / 32000.0
+            self._idle_sec += block_dur_sec
         return delta
 
     def maybe_reset(self, is_idle: bool) -> bool:
-        """Bound listener window size in O(1) across 5+ min calls."""
-        if self.window_seconds >= self.hard_reset_sec or (
-            is_idle and self._idle_sec >= self.idle_reset_sec and len(self._rolling_pcm) > 0
+        """Reset overlap/window tracking when idle or active duration hits bounds."""
+        if self._active_sec >= self.hard_reset_sec or (
+            is_idle
+            and self._idle_sec >= self.idle_reset_sec
+            and (len(self._prev_tail_pcm) > 0 or bool(self._prev_chunk_text))
         ):
             self.reset_window()
             return True
@@ -309,6 +334,7 @@ class VllmStreamingConversationSession:
         self.active_user_pcm_blocks.clear()
         self.empty_chunk_streak = 0
         self.user_blocks_in_turn = 0
+        self.listener.reset_window()
         events.append(
             {
                 "type": "user_turn_committed",
@@ -415,14 +441,30 @@ class VllmStreamingConversationSession:
         if not pcm16_bytes:
             return []
         self.listener.reset_window()
-        bsize = self.listener.block_bytes
-        parts: list[str] = []
-        for off in range(0, len(pcm16_bytes), bsize):
-            part = self.listener.step_block(pcm16_bytes[off : off + bsize])
-            if has_real_speech(part):
-                parts.append(part)
-        self.listener.maybe_reset(is_idle=True)
-        transcript = " ".join(parts).strip() or "(spoken message)"
+        profile = get_language_profile(self.language)
+        wav_bytes = pcm16_to_wav_bytes(pcm16_bytes, sample_rate=16000)
+        b64_wav = base64.b64encode(wav_bytes).decode("ascii")
+        transcript = self._complete_text_chat(
+            [
+                {
+                    "role": "system",
+                    "content": f"Perform ASR in {profile.router_language_name}.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "audio_url",
+                            "audio_url": {"url": f"data:audio/wav;base64,{b64_wav}"},
+                        }
+                    ],
+                },
+            ],
+            max_tokens=256,
+            temperature=0.0,
+        )
+        self.listener.reset_window()
+        transcript = transcript.strip() or "(spoken message)"
         turn_id = f"usr-{uuid.uuid4().hex[:8]}"
         self.history.append(
             TurnRecord(role="user", text=transcript, user_pcm16=pcm16_bytes)
@@ -571,8 +613,6 @@ class VllmStreamingConversationSession:
                     content: Any = [
                         {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{b64}"}}
                     ]
-                    if turn.text and not turn.text.startswith("("):
-                        content.append({"type": "text", "text": turn.text})
                     messages.append({"role": "user", "content": content})
                 else:
                     messages.append({"role": "user", "content": turn.text})
@@ -766,7 +806,7 @@ class VllmStreamingConversationSession:
         first_chunk_samples = 0
         total_audio_bytes = 0
         is_first_audio = True
-        step_counter = 0
+        last_mic_poll = time.perf_counter()
 
         def check_barge_in() -> None:
             if poll_mic_fn is None:
@@ -784,8 +824,9 @@ class VllmStreamingConversationSession:
                     if cancel_event.is_set():
                         resp.close()
                         break
-                    step_counter += 1
-                    if step_counter % 8 == 0:
+                    now_poll = time.perf_counter()
+                    if now_poll - last_mic_poll >= 0.50:
+                        last_mic_poll = now_poll
                         check_barge_in()
                         if cancel_event.is_set():
                             resp.close()
