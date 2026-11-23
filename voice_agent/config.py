@@ -94,7 +94,10 @@ class EngineSettings:
 
     backend: str = "mlx"  # "mlx" | "vllm"
     model_id: str = "LiquidAI/LFM3-Omni-2B-MLX-8bit"
-    vllm_base_url: str = "http://127.0.0.1:8091"
+    model_revision: str = "21d75123f86c1f7ffb4bef1ea202710c4e7ebe67"
+    vllm_deploy_config: str = "deploy/lfm3_omni_runpod.yaml"
+    vllm_max_audio_per_prompt: int = 8
+    vllm_base_url: str = ""
     vllm_api_key: str | None = None
     vllm_timeout_sec: float = 90.0
     audio_temperature: float = 0.4
@@ -250,5 +253,8 @@ class VoiceAgentConfig:
             "record_call_audio": self.record_call_audio,
         }
         if self.engine.backend == "vllm":
-            pub["vllm_base_url"] = self.engine.vllm_base_url
+            pub["vllm_api_mode"] = "native_async_omni"
+            pub["vllm_deploy_config"] = self.engine.vllm_deploy_config
+            if self.engine.vllm_base_url:
+                pub["vllm_base_url"] = self.engine.vllm_base_url
         return pub

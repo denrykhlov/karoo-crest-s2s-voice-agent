@@ -1,17 +1,21 @@
-"""vLLM-Omni (Linux/CUDA) pure-S2S inference backend via OpenAI-compatible HTTP/SSE."""
+"""vLLM-Omni (Linux/CUDA) pure-S2S inference backend via native in-process `AsyncOmni`."""
 
 from __future__ import annotations
 
-import base64
+import asyncio
 import json
+import os
+import queue
 import threading
 import time
 import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
-import httpx
+import numpy as np
 
 from .config import EngineSettings, PersonaConfig, ToolSpec
 from .languages import get_language_profile, normalize_language_code
@@ -23,13 +27,98 @@ from .protocol import (
     clean_display_text,
     has_real_speech,
     is_likely_agent_echo,
-    is_semantically_complete,
     parse_tool_calls,
-    pcm16_to_wav_bytes,
     render_tool_calls,
     required_empty_chunks,
-    strip_wav_header_if_present,
 )
+
+# ---------------------------------------------------------------------------
+# Pure-NumPy audio & prompt helpers (zero MLX / vLLM top-level imports)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SimpleSamplingParams:
+    """Fallback stand-in for `vllm.SamplingParams` when `vllm` is not installed."""
+
+    temperature: float = 0.0
+    max_tokens: int = 900
+    top_p: float = 1.0
+    output_kind: Any = "DELTA"
+    extra_args: dict[str, Any] = field(default_factory=dict)
+
+
+def _pcm16_to_float32(pcm16_bytes: bytes) -> np.ndarray:
+    """Decode little-endian 16-bit mono PCM bytes to float32 in [-1.0, 1.0]."""
+    if not pcm16_bytes:
+        return np.zeros((0,), dtype=np.float32)
+    return np.frombuffer(pcm16_bytes, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def _float32_to_pcm16(audio: np.ndarray) -> bytes:
+    """Encode float32 waveform in [-1.0, 1.0] to little-endian 16-bit PCM bytes."""
+    if audio.size == 0:
+        return b""
+    clipped = np.clip(audio.astype(np.float32, copy=False), -1.0, 1.0)
+    return (clipped * 32767.0).astype("<i2").tobytes()
+
+
+def _to_float32_1d(arr_or_tensor: Any) -> np.ndarray:
+    """Convert a torch Tensor or array-like chunk into a 1D float32 numpy array."""
+    if arr_or_tensor is None:
+        return np.zeros((0,), dtype=np.float32)
+    if hasattr(arr_or_tensor, "detach"):
+        arr = arr_or_tensor.detach().cpu().float().numpy()
+    else:
+        arr = np.asarray(arr_or_tensor, dtype=np.float32)
+    return arr.reshape(-1)
+
+
+def _audio_output_to_pcm16(audio_obj: Any) -> bytes:
+    """Normalize Stage 1 `multimodal_output['audio']` payload into 24 kHz PCM16 bytes."""
+    if audio_obj is None:
+        return b""
+    if isinstance(audio_obj, (list, tuple)):
+        parts = [_to_float32_1d(item) for item in audio_obj if item is not None]
+        parts = [p for p in parts if p.size > 0]
+        if not parts:
+            return b""
+        combined = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+    else:
+        combined = _to_float32_1d(audio_obj)
+    if combined.size == 0:
+        return b""
+    return _float32_to_pcm16(combined)
+
+
+def _normalize_tool_calls_for_template(
+    calls: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Ensure tool call `arguments` are Python dicts required by LFM3 chat template."""
+    normalized: list[dict[str, Any]] = []
+    for call in calls:
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        raw_args = fn.get("arguments")
+        if isinstance(raw_args, str):
+            try:
+                parsed = json.loads(raw_args) if raw_args.strip() else {}
+            except json.JSONDecodeError:
+                parsed = {}
+            args_dict = parsed if isinstance(parsed, dict) else {}
+        elif isinstance(raw_args, dict):
+            args_dict = dict(raw_args)
+        else:
+            args_dict = {}
+        normalized.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": str(fn.get("name") or ""),
+                    "arguments": args_dict,
+                },
+            }
+        )
+    return normalized
 
 
 def _parse_router_query(raw_router_text: str, fallback_text: str) -> tuple[str, str]:
@@ -74,20 +163,353 @@ def _dedup_overlap_delta(prev_text: str, new_text: str) -> str:
     return " ".join(orig_new_words[overlap_k:]).strip()
 
 
-class VllmLiveS2SListener:
-    """Pure-S2S always-streaming audio listener backed by vLLM-Omni `/v1/chat/completions`."""
+# ---------------------------------------------------------------------------
+# Dedicated asyncio bridge for native in-process vllm_omni.AsyncOmni
+# ---------------------------------------------------------------------------
+
+
+class _NativeOmniRunner:
+    """Owns the background asyncio event loop driving `vllm_omni.AsyncOmni`."""
 
     def __init__(
         self,
-        client_factory: Callable[[], httpx.Client],
-        model_id: str,
+        omni: Any,
+        tokenizer: Any,
+        *,
+        timeout_sec: float = 90.0,
+    ) -> None:
+        self.omni = omni
+        self.tokenizer = tokenizer
+        self.num_stages: int = max(1, int(getattr(omni, "num_stages", 2)))
+        self.timeout_sec: float = float(timeout_sec)
+
+        self._sampling_params_cls: Any = None
+        self._delta_kind: Any = "DELTA"
+        self._final_kind: Any = "FINAL_ONLY"
+        self._resolve_sampling_types()
+
+        self._loop_ready = threading.Event()
+        self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run_event_loop,
+            name="vllm-omni-loop",
+            daemon=True,
+        )
+        self._thread.start()
+        self._loop_ready.wait(timeout=5.0)
+
+    def _resolve_sampling_types(self) -> None:
+        try:
+            from vllm import SamplingParams
+            from vllm.sampling_params import RequestOutputKind
+
+            self._sampling_params_cls = SamplingParams
+            self._delta_kind = RequestOutputKind.DELTA
+            self._final_kind = RequestOutputKind.FINAL_ONLY
+        except ImportError:
+            self._sampling_params_cls = _SimpleSamplingParams
+            self._delta_kind = "DELTA"
+            self._final_kind = "FINAL_ONLY"
+
+    def _run_event_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop_ready.set()
+        try:
+            self._loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                try:
+                    self._loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+                except Exception:
+                    pass
+            self._loop.close()
+
+    def build_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: Optional[list[dict[str, Any]]] = None,
+        audio_clips_16k: Optional[list[np.ndarray]] = None,
+        add_generation_prompt: bool = True,
+        continue_final_message: bool = False,
+        append_suffix: str = "",
+    ) -> dict[str, Any]:
+        """Render LFM3 chat messages + optional tools/audio into a native `TokensPrompt` dict."""
+        template_kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": bool(add_generation_prompt),
+            "continue_final_message": bool(continue_final_message),
+        }
+        if tools:
+            template_kwargs["tools"] = tools
+
+        rendered = str(self.tokenizer.apply_chat_template(messages, **template_kwargs))
+        if append_suffix:
+            rendered += append_suffix
+
+        # Critical: LFM3 chat_template already emits leading bos_token.
+        prompt_ids = list(self.tokenizer.encode(rendered, add_special_tokens=False))
+        prompt: dict[str, Any] = {"prompt_token_ids": prompt_ids}
+        if audio_clips_16k:
+            clips = [
+                (np.asarray(clip, dtype=np.float32).reshape(-1), 16000)
+                for clip in audio_clips_16k
+            ]
+            prompt["multi_modal_data"] = {
+                "audio": clips[0] if len(clips) == 1 else clips
+            }
+        return prompt
+
+    def build_sampling_params_list(
+        self,
+        *,
+        temperature: float,
+        max_tokens: int,
+        extra_args: Optional[dict[str, Any]] = None,
+        top_p: Optional[float] = None,
+        streaming: bool = False,
+    ) -> list[Any]:
+        """Construct per-stage `SamplingParams` matching `omni.num_stages`."""
+        out_kind = self._delta_kind if streaming else self._final_kind
+        stage0_kwargs: dict[str, Any] = {
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+            "output_kind": out_kind,
+            "extra_args": dict(extra_args or {}),
+        }
+        if top_p is not None and float(temperature) > 0.0:
+            stage0_kwargs["top_p"] = float(top_p)
+
+        params_list = [self._sampling_params_cls(**stage0_kwargs)]
+        for _ in range(1, self.num_stages):
+            params_list.append(
+                self._sampling_params_cls(
+                    temperature=0.0,
+                    max_tokens=1,
+                    output_kind=out_kind,
+                )
+            )
+        return params_list
+
+    def complete_text(
+        self,
+        prompt: dict[str, Any],
+        *,
+        max_tokens: int,
+        temperature: float = 0.0,
+        extra_args: Optional[dict[str, Any]] = None,
+    ) -> str:
+        """Run a non-streaming text-only request on `AsyncOmni`."""
+        req_id = f"txt-{uuid.uuid4().hex[:12]}"
+        params = self.build_sampling_params_list(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_args=extra_args if extra_args is not None else {"generation_mode": "text"},
+            streaming=False,
+        )
+
+        async def _run() -> str:
+            latest_text = ""
+            async for output in self.omni.generate(
+                prompt=prompt,
+                request_id=req_id,
+                sampling_params_list=params,
+                output_modalities=["text"],
+            ):
+                if getattr(output, "error", None):
+                    raise RuntimeError(str(output.error))
+                out_type = getattr(output, "final_output_type", None)
+                stage_id = getattr(output, "stage_id", None)
+                if out_type == "text" or stage_id in (None, 0):
+                    outputs = getattr(output, "outputs", None) or []
+                    if outputs and getattr(outputs[0], "text", None) is not None:
+                        latest_text = str(outputs[0].text)
+            return clean_display_text(latest_text)
+
+        fut = asyncio.run_coroutine_threadsafe(_run(), self._loop)
+        try:
+            return fut.result(timeout=self.timeout_sec)
+        except BaseException:
+            if not fut.done():
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.omni.abort(req_id), self._loop
+                    )
+                except Exception:
+                    pass
+            raise
+
+    def stream_generate(
+        self,
+        prompt: dict[str, Any],
+        *,
+        sampling_params_list: list[Any],
+        output_modalities: list[str],
+        cancel_event: threading.Event,
+        on_text_delta: Callable[[str], None],
+        on_audio_pcm: Callable[[bytes], None],
+        poll_barge_in: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Stream Stage 0 text + Stage 1 audio via a thread-safe queue (never blocks `_loop`)."""
+        item_q: queue.Queue[tuple[str, Any]] = queue.Queue()
+        req_id = f"omni-{uuid.uuid4().hex[:12]}"
+
+        async def _pump() -> None:
+            finished_normally = False
+            try:
+                async for output in self.omni.generate(
+                    prompt=prompt,
+                    request_id=req_id,
+                    sampling_params_list=sampling_params_list,
+                    output_modalities=output_modalities,
+                ):
+                    if cancel_event.is_set():
+                        break
+                    if getattr(output, "error", None):
+                        raise RuntimeError(str(output.error))
+
+                    out_type = getattr(output, "final_output_type", None)
+                    if out_type is None:
+                        out_type = (
+                            "audio" if getattr(output, "stage_id", None) == 1 else "text"
+                        )
+
+                    outputs = getattr(output, "outputs", None) or []
+                    out0 = outputs[0] if outputs else None
+                    if out_type == "text":
+                        piece = getattr(out0, "text", "") if out0 is not None else ""
+                        if piece:
+                            item_q.put(("text", str(piece)))
+                    elif out_type == "audio":
+                        mm = (
+                            (getattr(out0, "multimodal_output", None) if out0 is not None else None)
+                            or getattr(output, "multimodal_output", None)
+                            or {}
+                        )
+                        if isinstance(mm, dict):
+                            pcm = _audio_output_to_pcm16(mm.get("audio"))
+                            if pcm:
+                                item_q.put(("audio", pcm))
+                finished_normally = not cancel_event.is_set()
+            except Exception as exc:
+                if not cancel_event.is_set():
+                    item_q.put(("error", exc))
+            finally:
+                if not finished_normally:
+                    try:
+                        await self.omni.abort(req_id)
+                    except Exception:
+                        pass
+                item_q.put(("done", None))
+
+        pump_fut = asyncio.run_coroutine_threadsafe(_pump(), self._loop)
+        last_poll = time.perf_counter()
+        abort_requested = False
+
+        def _trigger_abort() -> None:
+            nonlocal abort_requested
+            if abort_requested:
+                return
+            abort_requested = True
+            if not pump_fut.done():
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.omni.abort(req_id), self._loop
+                    )
+                except Exception:
+                    pass
+
+        try:
+            while True:
+                if cancel_event.is_set():
+                    _trigger_abort()
+                now = time.perf_counter()
+                if (
+                    poll_barge_in is not None
+                    and not cancel_event.is_set()
+                    and (now - last_poll >= 0.50)
+                ):
+                    last_poll = now
+                    poll_barge_in()
+                    if cancel_event.is_set():
+                        _trigger_abort()
+
+                try:
+                    kind, payload = item_q.get(timeout=0.05)
+                except queue.Empty:
+                    if cancel_event.is_set() and pump_fut.done():
+                        break
+                    continue
+
+                if kind == "done":
+                    break
+                if kind == "error":
+                    raise payload
+                if cancel_event.is_set():
+                    _trigger_abort()
+                    continue
+                if kind == "text":
+                    on_text_delta(payload)
+                elif kind == "audio":
+                    on_audio_pcm(payload)
+
+            try:
+                pump_fut.result(timeout=5.0)
+            except Exception:
+                if not cancel_event.is_set():
+                    raise
+        except BaseException:
+            _trigger_abort()
+            raise
+
+    def shutdown(self) -> None:
+        omni_shutdown = getattr(self.omni, "shutdown", None)
+        if callable(omni_shutdown):
+            try:
+                omni_shutdown()
+            except Exception:
+                pass
+        if self._loop.is_running():
+            async def _cancel_all() -> None:
+                current = asyncio.current_task()
+                for task in asyncio.all_tasks():
+                    if task is not current and not task.done():
+                        task.cancel()
+
+            try:
+                asyncio.run_coroutine_threadsafe(_cancel_all(), self._loop).result(timeout=2.0)
+            except Exception:
+                pass
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except Exception:
+                pass
+        if self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# Pure-S2S Live Listener & Conversation Session
+# ---------------------------------------------------------------------------
+
+
+class VllmLiveS2SListener:
+    """Pure-S2S always-streaming audio listener backed by native `AsyncOmni`."""
+
+    def __init__(
+        self,
+        runner: _NativeOmniRunner,
         idle_reset_sec: float = 15.0,
         hard_reset_sec: float = 30.0,
         block_bytes: int = 20480,  # 640 ms @ 16 kHz mono Int16
         overlap_bytes: int = 20480,  # 640 ms left overlap (1.28 s O(1) window)
     ) -> None:
-        self._client_factory = client_factory
-        self.model_id = model_id
+        self._runner = runner
         self.idle_reset_sec = float(idle_reset_sec)
         self.hard_reset_sec = float(hard_reset_sec)
         self.block_bytes = int(block_bytes)
@@ -118,46 +540,25 @@ class VllmLiveS2SListener:
         self._prev_tail_pcm = (
             pcm16_block[-self.overlap_bytes :] if self.overlap_bytes > 0 else b""
         )
-        wav_bytes = pcm16_to_wav_bytes(window_pcm, sample_rate=16000)
-        b64_wav = base64.b64encode(wav_bytes).decode("ascii")
-        # Native assistant-turn `Perform live ASR.` emits `<|text_end|>`/`<|im_end|>` on silence;
-        # trailing empty text block satisfies `continue_final_message=True` in Jinja templates.
-        payload = {
-            "model": self.model_id,
-            "messages": [
+        wav_f32 = _pcm16_to_float32(window_pcm)
+        prompt = self._runner.build_prompt(
+            [
                 {"role": "system", "content": "Perform live ASR."},
                 {
                     "role": "assistant",
-                    "content": [
-                        {
-                            "type": "audio_url",
-                            "audio_url": {"url": f"data:audio/wav;base64,{b64_wav}"},
-                        },
-                        {"type": "text", "text": ""},
-                    ],
+                    "content": [{"type": "audio"}, {"type": "text", "text": ""}],
                 },
             ],
-            "add_generation_prompt": False,
-            "continue_final_message": True,
-            "modalities": ["text"],
-            "temperature": 0.0,
-            "max_tokens": 48,
-            "stream": False,
-            "sampling_params_list": [
-                {
-                    "temperature": 0.0,
-                    "max_tokens": 48,
-                    "extra_args": {"generation_mode": "text"},
-                }
-            ],
-        }
-        with self._client_factory() as client:
-            resp = client.post("/v1/chat/completions", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-
-        msg = ((data.get("choices") or [{}])[0].get("message") or {})
-        raw_text = clean_display_text(str(msg.get("content") or ""))
+            audio_clips_16k=[wav_f32],
+            add_generation_prompt=False,
+            continue_final_message=True,
+        )
+        raw_text = self._runner.complete_text(
+            prompt,
+            max_tokens=48,
+            temperature=0.0,
+            extra_args={"generation_mode": "text"},
+        )
         block_dur_sec = len(pcm16_block) / 32000.0
         if not has_real_speech(raw_text):
             self._prev_chunk_text = ""
@@ -186,18 +587,17 @@ class VllmLiveS2SListener:
 
 
 class VllmStreamingConversationSession:
-    """Single-interface S2S conversation orchestrator running against `vllm-omni`."""
+    """Single-interface S2S conversation orchestrator running against native `AsyncOmni`."""
 
     def __init__(
         self,
-        client_factory: Callable[[], httpx.Client],
+        runner: _NativeOmniRunner,
         settings: EngineSettings,
     ) -> None:
-        self._client_factory = client_factory
+        self._runner = runner
         self.settings = settings
         self.listener = VllmLiveS2SListener(
-            client_factory=client_factory,
-            model_id=settings.model_id,
+            runner=runner,
             idle_reset_sec=settings.listener_idle_reset_sec,
             hard_reset_sec=settings.listener_hard_reset_sec,
         )
@@ -270,11 +670,12 @@ class VllmStreamingConversationSession:
             self.history.append(TurnRecord(role="user", text=clean))
 
     def append_tool_exchange(self, calls: list[dict[str, Any]], results_json: str) -> None:
+        normalized_calls = _normalize_tool_calls_for_template(calls)
         self.history.append(
             TurnRecord(
                 role="assistant",
-                text=render_tool_calls(calls),
-                tool_calls=calls,
+                text=render_tool_calls(normalized_calls),
+                tool_calls=normalized_calls,
             )
         )
         self.history.append(TurnRecord(role="tool", text=results_json))
@@ -442,26 +843,23 @@ class VllmStreamingConversationSession:
             return []
         self.listener.reset_window()
         profile = get_language_profile(self.language)
-        wav_bytes = pcm16_to_wav_bytes(pcm16_bytes, sample_rate=16000)
-        b64_wav = base64.b64encode(wav_bytes).decode("ascii")
-        transcript = self._complete_text_chat(
+        wav_f32 = _pcm16_to_float32(pcm16_bytes)
+        prompt = self._runner.build_prompt(
             [
                 {
                     "role": "system",
                     "content": f"Perform ASR in {profile.router_language_name}.",
                 },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "audio_url",
-                            "audio_url": {"url": f"data:audio/wav;base64,{b64_wav}"},
-                        }
-                    ],
-                },
+                {"role": "user", "content": [{"type": "audio"}]},
             ],
+            audio_clips_16k=[wav_f32],
+            add_generation_prompt=True,
+        )
+        transcript = self._runner.complete_text(
+            prompt,
             max_tokens=256,
             temperature=0.0,
+            extra_args={"generation_mode": "text"},
         )
         self.listener.reset_window()
         transcript = transcript.strip() or "(spoken message)"
@@ -528,49 +926,39 @@ class VllmStreamingConversationSession:
         if not digest_lines:
             return False
         try:
-            prompt = (
+            prompt_text = (
                 "Summarize the following Karoo Crest Bank telesales call state concisely "
                 "(customer name, income, card tier preferences, questions answered, tool results):\n\n"
                 + "\n".join(digest_lines[-16:])
             )
-            payload = {
-                "model": self.settings.model_id,
-                "messages": [
+            prompt = self._runner.build_prompt(
+                [
                     {"role": "system", "content": "Produce a compact factual call memory summary."},
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": prompt_text},
                 ],
-                "modalities": ["text"],
-                "temperature": 0.0,
-                "max_tokens": 220,
-                "stream": False,
-                "sampling_params_list": [
-                    {
-                        "temperature": 0.0,
-                        "max_tokens": 220,
-                        "extra_args": {"generation_mode": "text"},
-                    }
-                ],
-            }
-            with self._client_factory() as client:
-                resp = client.post("/v1/chat/completions", json=payload)
-                resp.raise_for_status()
-                msg = ((resp.json().get("choices") or [{}])[0].get("message") or {})
-                summary = clean_display_text(str(msg.get("content") or ""))
-                if summary:
-                    self._rolling_summary = summary
+                add_generation_prompt=True,
+            )
+            summary = self._runner.complete_text(
+                prompt,
+                max_tokens=220,
+                temperature=0.0,
+                extra_args={"generation_mode": "text"},
+            )
+            if summary:
+                self._rolling_summary = summary
         except Exception:
             self._rolling_summary = " | ".join(digest_lines[-6:])
         self.history = list(kept_tail)
         self.compaction_count += 1
         return True
 
-    def _build_messages(
+    def _build_prompt(
         self,
         *,
         include_tools: bool = True,
         extra_system_note: str = "",
         force_mixed_prefix: bool = False,
-    ) -> tuple[list[dict[str, Any]], Optional[list[dict[str, Any]]]]:
+    ) -> dict[str, Any]:
         sys_parts = [self.system_prompt]
         if self._rolling_summary:
             sys_parts.append(f"EARLIER CALL SUMMARY:\n{self._rolling_summary}")
@@ -585,17 +973,12 @@ class VllmStreamingConversationSession:
         tool_schemas: Optional[list[dict[str, Any]]] = None
         if include_tools and self.tools:
             tool_schemas = [t.to_openai_schema() for t in self.tools]
-            tool_names = ", ".join(t.name for t in self.tools)
-            sys_parts.append(
-                f"Available CRM tools ({tool_names}): when calling a tool, emit "
-                "<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>."
-            )
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": "\n\n".join(p for p in sys_parts if p)}
         ]
 
-        # Only send raw audio on recent user turns so payloads remain compact on long calls.
+        # Keep raw audio waveforms for the most recent user turns; older turns fall back to text.
         recent_audio_indices: set[int] = set()
         audio_quota = max(1, int(self.settings.keep_recent_user_audio_turns))
         for idx in range(len(self.history) - 1, -1, -1):
@@ -605,53 +988,37 @@ class VllmStreamingConversationSession:
                 if audio_quota <= 0:
                     break
 
+        audio_clips_16k: list[np.ndarray] = []
         for idx, turn in enumerate(self.history):
             if turn.role == "user":
                 if idx in recent_audio_indices and turn.user_pcm16:
-                    wav_bytes = pcm16_to_wav_bytes(turn.user_pcm16, sample_rate=16000)
-                    b64 = base64.b64encode(wav_bytes).decode("ascii")
-                    content: Any = [
-                        {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{b64}"}}
-                    ]
-                    messages.append({"role": "user", "content": content})
+                    audio_clips_16k.append(_pcm16_to_float32(turn.user_pcm16))
+                    messages.append({"role": "user", "content": [{"type": "audio"}]})
                 else:
                     messages.append({"role": "user", "content": turn.text})
             elif turn.role == "assistant":
-                messages.append({"role": "assistant", "content": turn.text})
+                if turn.tool_calls:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": _normalize_tool_calls_for_template(turn.tool_calls),
+                        }
+                    )
+                else:
+                    messages.append({"role": "assistant", "content": turn.text})
             elif turn.role == "tool":
                 messages.append({"role": "tool", "content": turn.text})
 
-        if force_mixed_prefix:
-            messages.append({"role": "assistant", "content": "<|mixed_start|>"})
-        return messages, tool_schemas
-
-    def _complete_text_chat(
-        self,
-        messages: list[dict[str, Any]],
-        max_tokens: int = 64,
-        temperature: float = 0.0,
-    ) -> str:
-        payload = {
-            "model": self.settings.model_id,
-            "messages": messages,
-            "modalities": ["text"],
-            "temperature": float(temperature),
-            "max_tokens": int(max_tokens),
-            "stream": False,
-            "sampling_params_list": [
-                {
-                    "temperature": float(temperature),
-                    "max_tokens": int(max_tokens),
-                    "extra_args": {"generation_mode": "text"},
-                }
-            ],
-        }
-        with self._client_factory() as client:
-            resp = client.post("/v1/chat/completions", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        msg = ((data.get("choices") or [{}])[0].get("message") or {})
-        return clean_display_text(str(msg.get("content") or ""))
+        use_mixed_prefix = bool(force_mixed_prefix and not tool_schemas)
+        return self._runner.build_prompt(
+            messages,
+            tools=tool_schemas,
+            audio_clips_16k=audio_clips_16k or None,
+            add_generation_prompt=True,
+            continue_final_message=False,
+            append_suffix="<|mixed_start|>" if use_mixed_prefix else "",
+        )
 
     def _stream_tts_fallback(
         self,
@@ -662,88 +1029,51 @@ class VllmStreamingConversationSession:
         t_start: float,
     ) -> tuple[int, float, int, int]:
         profile = get_language_profile(self.language)
-        instructions = f"Perform TTS in {profile.tts_accent} using a {persona.voice_gender} voice."
-        payload = {
-            "model": self.settings.model_id,
-            "input": text,
-            "instructions": instructions,
-            "response_format": "pcm",
-            "stream": True,
-            "stream_format": "audio",
-            "extra_params": {
+        system_msg = f"Perform TTS in {profile.tts_accent} using a {persona.voice_gender} voice."
+        prompt = self._runner.build_prompt(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": text},
+            ],
+            add_generation_prompt=True,
+            append_suffix="<|audio_start|>",
+        )
+        params = self._runner.build_sampling_params_list(
+            temperature=0.0,
+            max_tokens=int(self.settings.max_slots),
+            extra_args={
                 "audio_temperature": float(self.settings.audio_temperature),
                 "audio_top_k": int(self.settings.audio_top_k),
                 "audio_repetition_penalty": float(self.settings.audio_repetition_penalty),
+                "audio_repetition_window": int(self.settings.audio_repetition_window),
             },
-        }
+            streaming=True,
+        )
+
         chunks_sent = 0
         first_chunk_samples = 0
         ttfa_ms = 0.0
         total_pcm_bytes = 0
-        is_first = True
 
-        with self._client_factory() as client:
-            with client.stream("POST", "/v1/audio/speech", json=payload) as resp:
-                resp.raise_for_status()
-                ctype = (resp.headers.get("content-type") or "").lower()
-                if "text/event-stream" in ctype or "ndjson" in ctype or "json" in ctype:
-                    for raw_line in resp.iter_lines():
-                        if cancel_event.is_set():
-                            resp.close()
-                            break
-                        line = raw_line.strip()
-                        if not line:
-                            continue
-                        if line.startswith("data:"):
-                            line = line[5:].strip()
-                        if line == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        b64 = obj.get("audio")
-                        if b64 is None:
-                            choice = (obj.get("choices") or [{}])[0]
-                            delta = choice.get("delta") or {}
-                            b64 = (delta.get("audio") or {}).get("data") or delta.get("content")
-                        if not b64:
-                            continue
-                        pcm = base64.b64decode(b64)
-                        if is_first:
-                            pcm = strip_wav_header_if_present(pcm)
-                            is_first = False
-                        if not pcm:
-                            continue
-                        if ttfa_ms == 0.0:
-                            ttfa_ms = (time.perf_counter() - t_start) * 1000.0
-                            first_chunk_samples = len(pcm) // 2
-                        chunks_sent += 1
-                        total_pcm_bytes += len(pcm)
-                        emit({"type": "audio_chunk", "pcm16": pcm, "samples": len(pcm) // 2})
-                else:
-                    remainder = b""
-                    for raw_bytes in resp.iter_bytes(chunk_size=3840):
-                        if cancel_event.is_set():
-                            resp.close()
-                            break
-                        if not raw_bytes:
-                            continue
-                        data_bytes = remainder + raw_bytes
-                        if is_first:
-                            data_bytes = strip_wav_header_if_present(data_bytes)
-                            is_first = False
-                        even_len = len(data_bytes) & ~1
-                        pcm = data_bytes[:even_len]
-                        remainder = data_bytes[even_len:]
-                        if not pcm:
-                            continue
-                        if ttfa_ms == 0.0:
-                            ttfa_ms = (time.perf_counter() - t_start) * 1000.0
-                            first_chunk_samples = len(pcm) // 2
-                        chunks_sent += 1
-                        total_pcm_bytes += len(pcm)
-                        emit({"type": "audio_chunk", "pcm16": pcm, "samples": len(pcm) // 2})
+        def on_audio_pcm(pcm: bytes) -> None:
+            nonlocal chunks_sent, first_chunk_samples, ttfa_ms, total_pcm_bytes
+            if not pcm:
+                return
+            if ttfa_ms == 0.0:
+                ttfa_ms = (time.perf_counter() - t_start) * 1000.0
+                first_chunk_samples = len(pcm) // 2
+            chunks_sent += 1
+            total_pcm_bytes += len(pcm)
+            emit({"type": "audio_chunk", "pcm16": pcm, "samples": len(pcm) // 2})
+
+        self._runner.stream_generate(
+            prompt,
+            sampling_params_list=params,
+            output_modalities=["audio"],
+            cancel_event=cancel_event,
+            on_text_delta=lambda _piece: None,
+            on_audio_pcm=on_audio_pcm,
+        )
 
         audio_frames = max(0, total_pcm_bytes // (2 * 1920))
         return audio_frames, ttfa_ms, chunks_sent, first_chunk_samples
@@ -762,152 +1092,127 @@ class VllmStreamingConversationSession:
         extra_system_note: str = "",
     ) -> TurnOutcome:
         t_start = time.perf_counter()
-        use_mixed_prefix = bool(force_interleaved and not tools)
-        messages, tool_schemas = self._build_messages(
-            include_tools=bool(tools),
+        use_tools = bool(tools) and not force_interleaved
+        prompt = self._build_prompt(
+            include_tools=use_tools,
             extra_system_note=extra_system_note,
-            force_mixed_prefix=use_mixed_prefix,
+            force_mixed_prefix=not use_tools,
         )
-        audio_extra_args: dict[str, Any] = {
-            "audio_temperature": float(self.settings.audio_temperature),
-            "audio_top_k": int(self.settings.audio_top_k),
-            "audio_repetition_penalty": float(self.settings.audio_repetition_penalty),
-        }
-        payload: dict[str, Any] = {
-            "model": self.settings.model_id,
-            "messages": messages,
-            "modalities": ["text", "audio"],
-            "audio": {"format": "pcm"},
-            "temperature": float(self.settings.text_temperature),
-            "top_p": float(self.settings.text_top_p),
-            "max_tokens": int(max_tokens or self.settings.max_slots),
-            "stream": True,
-            "sampling_params_list": [
-                {
-                    "temperature": float(self.settings.text_temperature),
-                    "top_p": float(self.settings.text_top_p),
-                    "max_tokens": int(max_tokens or self.settings.max_slots),
-                    "extra_args": audio_extra_args,
-                }
-            ],
-        }
-        if tool_schemas:
-            payload["tools"] = tool_schemas
-        if use_mixed_prefix:
-            payload["continue_final_message"] = True
-            payload["add_generation_prompt"] = False
+        sampling_params_list = self._runner.build_sampling_params_list(
+            temperature=float(self.settings.text_temperature),
+            top_p=float(self.settings.text_top_p),
+            max_tokens=int(max_tokens or self.settings.max_slots),
+            extra_args={
+                "audio_temperature": float(self.settings.audio_temperature),
+                "audio_top_k": int(self.settings.audio_top_k),
+                "audio_repetition_penalty": float(self.settings.audio_repetition_penalty),
+                "audio_repetition_window": int(self.settings.audio_repetition_window),
+            },
+            streaming=True,
+        )
 
         raw_text_acc = ""
         clean_text_acc = ""
-        openai_tool_calls: dict[int, dict[str, Any]] = {}
         ttft_ms = 0.0
         ttfa_ms = 0.0
         chunks_sent = 0
         first_chunk_samples = 0
         total_audio_bytes = 0
-        is_first_audio = True
-        last_mic_poll = time.perf_counter()
+        text_streaming_allowed = not use_tools
+        tool_mode_detected = False
+
+        def emit_clean_diff(new_clean: str) -> None:
+            nonlocal clean_text_acc
+            if new_clean == clean_text_acc:
+                return
+            diff = (
+                new_clean[len(clean_text_acc) :]
+                if new_clean.startswith(clean_text_acc)
+                else new_clean
+            )
+            clean_text_acc = new_clean
+            if diff:
+                on_event(
+                    {
+                        "type": "text_delta",
+                        "delta": diff,
+                        "text": clean_text_acc,
+                        "segment": segment,
+                    }
+                )
+
+        def on_text_delta(piece: str) -> None:
+            nonlocal raw_text_acc, ttft_ms, text_streaming_allowed, tool_mode_detected
+            if not piece:
+                return
+            raw_text_acc += piece
+            if ttft_ms == 0.0:
+                ttft_ms = (time.perf_counter() - t_start) * 1000.0
+            if "<think>" in raw_text_acc and "</think>" not in raw_text_acc:
+                return
+
+            new_clean = clean_display_text(raw_text_acc)
+            stripped = new_clean.lstrip()
+            if (
+                stripped.startswith("<tool_call")
+                or stripped.startswith("<function")
+                or "<tool_call>" in new_clean
+            ):
+                tool_mode_detected = True
+                text_streaming_allowed = False
+                return
+
+            if not text_streaming_allowed and not tool_mode_detected:
+                if (
+                    "<|mixed_start|>" in raw_text_acc
+                    or "<|audio_start|>" in raw_text_acc
+                    or chunks_sent > 0
+                    or (len(stripped) >= 16 and "<" not in stripped)
+                ):
+                    text_streaming_allowed = True
+
+            if text_streaming_allowed and new_clean:
+                emit_clean_diff(new_clean)
+
+        def on_audio_pcm(pcm: bytes) -> None:
+            nonlocal chunks_sent, first_chunk_samples, ttfa_ms, total_audio_bytes, text_streaming_allowed
+            if not pcm:
+                return
+            if ttfa_ms == 0.0:
+                ttfa_ms = (time.perf_counter() - t_start) * 1000.0
+                first_chunk_samples = len(pcm) // 2
+            if not tool_mode_detected and not text_streaming_allowed:
+                new_clean = clean_display_text(raw_text_acc)
+                if new_clean and not new_clean.lstrip().startswith("<"):
+                    text_streaming_allowed = True
+                    emit_clean_diff(new_clean)
+            chunks_sent += 1
+            total_audio_bytes += len(pcm)
+            on_event(
+                {
+                    "type": "audio_chunk",
+                    "pcm16": pcm,
+                    "samples": len(pcm) // 2,
+                }
+            )
 
         def check_barge_in() -> None:
             if poll_mic_fn is None:
                 return
-            evs = poll_mic_fn()
-            for ev in evs:
+            for ev in poll_mic_fn():
                 if ev.get("type") == "barge_in_detected":
                     cancel_event.set()
                     return
 
-        with self._client_factory() as client:
-            with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
-                resp.raise_for_status()
-                for raw_line in resp.iter_lines():
-                    if cancel_event.is_set():
-                        resp.close()
-                        break
-                    now_poll = time.perf_counter()
-                    if now_poll - last_mic_poll >= 0.50:
-                        last_mic_poll = now_poll
-                        check_barge_in()
-                        if cancel_event.is_set():
-                            resp.close()
-                            break
-
-                    line = raw_line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    body = line[5:].strip()
-                    if body == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(body)
-                    except json.JSONDecodeError:
-                        continue
-
-                    modality = chunk.get("modality")
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-
-                    if delta.get("tool_calls"):
-                        for tc in delta["tool_calls"]:
-                            idx = int(tc.get("index", 0))
-                            slot = openai_tool_calls.setdefault(
-                                idx, {"type": "function", "function": {"name": "", "arguments": ""}}
-                            )
-                            fn = tc.get("function") or {}
-                            if fn.get("name"):
-                                slot["function"]["name"] += str(fn["name"])
-                            if fn.get("arguments"):
-                                slot["function"]["arguments"] += str(fn["arguments"])
-
-                    audio_b64: Optional[str] = None
-                    if modality == "audio":
-                        audio_b64 = delta.get("content") or (delta.get("audio") or {}).get("data")
-                    elif isinstance(delta.get("audio"), dict) and delta["audio"].get("data"):
-                        audio_b64 = delta["audio"]["data"]
-
-                    if audio_b64:
-                        pcm = base64.b64decode(audio_b64)
-                        if is_first_audio:
-                            pcm = strip_wav_header_if_present(pcm)
-                            is_first_audio = False
-                        if pcm:
-                            if ttfa_ms == 0.0:
-                                ttfa_ms = (time.perf_counter() - t_start) * 1000.0
-                                first_chunk_samples = len(pcm) // 2
-                            chunks_sent += 1
-                            total_audio_bytes += len(pcm)
-                            on_event(
-                                {
-                                    "type": "audio_chunk",
-                                    "pcm16": pcm,
-                                    "samples": len(pcm) // 2,
-                                }
-                            )
-
-                    if modality in (None, "text"):
-                        piece = delta.get("content")
-                        if piece:
-                            raw_text_acc += str(piece)
-                            if ttft_ms == 0.0:
-                                ttft_ms = (time.perf_counter() - t_start) * 1000.0
-                            new_clean = clean_display_text(raw_text_acc)
-                            if "<tool_call>" not in new_clean and new_clean != clean_text_acc:
-                                diff = (
-                                    new_clean[len(clean_text_acc) :]
-                                    if new_clean.startswith(clean_text_acc)
-                                    else new_clean
-                                )
-                                clean_text_acc = new_clean
-                                on_event(
-                                    {
-                                        "type": "text_delta",
-                                        "delta": diff,
-                                        "text": clean_text_acc,
-                                        "segment": segment,
-                                    }
-                                )
+        self._runner.stream_generate(
+            prompt,
+            sampling_params_list=sampling_params_list,
+            output_modalities=["text", "audio"],
+            cancel_event=cancel_event,
+            on_text_delta=on_text_delta,
+            on_audio_pcm=on_audio_pcm,
+            poll_barge_in=check_barge_in if poll_mic_fn is not None else None,
+        )
 
         if cancel_event.is_set():
             partial_frames = total_audio_bytes // (2 * 1920)
@@ -930,22 +1235,7 @@ class VllmStreamingConversationSession:
                 cancelled=True,
             )
 
-        parsed_calls = parse_tool_calls(raw_text_acc)
-        if not parsed_calls and openai_tool_calls:
-            for idx in sorted(openai_tool_calls):
-                fn = openai_tool_calls[idx]["function"]
-                raw_args = fn.get("arguments") or "{}"
-                try:
-                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                except json.JSONDecodeError:
-                    parsed_args = {}
-                parsed_calls.append(
-                    {
-                        "type": "function",
-                        "function": {"name": fn.get("name", ""), "arguments": parsed_args},
-                    }
-                )
-
+        parsed_calls = parse_tool_calls(raw_text_acc) if use_tools else []
         if parsed_calls:
             return TurnOutcome(
                 kind="tool_calls",
@@ -956,6 +1246,9 @@ class VllmStreamingConversationSession:
             )
 
         final_text = clean_display_text(raw_text_acc) or clean_text_acc
+        if final_text and final_text != clean_text_acc:
+            emit_clean_diff(final_text)
+
         used_tts_fallback = False
         if final_text and chunks_sent == 0 and not cancel_event.is_set():
             used_tts_fallback = True
@@ -982,7 +1275,9 @@ class VllmStreamingConversationSession:
             audio_frames=audio_frames,
             ttfa_ms=ttfa_ms,
             ttft_ms=ttft_ms or ttfa_ms,
-            slots_per_sec=round((len(final_text.split()) + audio_frames) / max(wall_ms / 1000.0, 1e-3), 1),
+            slots_per_sec=round(
+                (len(final_text.split()) + audio_frames) / max(wall_ms / 1000.0, 1e-3), 1
+            ),
             audio_chunks_sent=chunks_sent,
             first_chunk_samples=first_chunk_samples,
             gen_wall_ms=wall_ms,
@@ -1018,7 +1313,7 @@ class VllmStreamingConversationSession:
         profile = get_language_profile(self.language)
         prev_asst = self.latest_assistant_text()
         ctx_line = f"Previous advisor turn: {prev_asst}\n" if prev_asst else ""
-        prompt = (
+        prompt_text = (
             f"{ctx_line}"
             f"Customer just said: {user_text or '(audio turn)'}\n\n"
             "Classify into exactly ONE line:\n"
@@ -1026,13 +1321,18 @@ class VllmStreamingConversationSession:
             f"- Output `DELEGATE: <concise standalone question in {profile.router_language_name}>` "
             "ONLY for detailed product policy, tariffs, FX fees, grace days, NCA/FICA/POPIA rules, or travel perks."
         )
-        raw = self._complete_text_chat(
+        prompt = self._runner.build_prompt(
             [
                 {"role": "system", "content": "Output strictly `DIRECT` or `DELEGATE: <question>`."},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": prompt_text},
             ],
+            add_generation_prompt=True,
+        )
+        raw = self._runner.complete_text(
+            prompt,
             max_tokens=self.settings.max_router_tokens,
             temperature=0.0,
+            extra_args={"generation_mode": "text"},
         )
         dec, query = _parse_router_query(raw, user_text)
         return dec, query, (time.perf_counter() - t0) * 1000.0
@@ -1040,18 +1340,23 @@ class VllmStreamingConversationSession:
     def _run_query_extract_call(self, user_text: str) -> str:
         profile = get_language_profile(self.language)
         prev_asst = self.latest_assistant_text()
-        prompt = (
+        prompt_text = (
             (f"Previous advisor turn: {prev_asst}\n" if prev_asst else "")
             + f"Customer message: {user_text or '(audio turn)'}\n"
             + f"Rewrite this as one crisp standalone banking knowledge question in {profile.router_language_name}."
         )
-        raw = self._complete_text_chat(
+        prompt = self._runner.build_prompt(
             [
                 {"role": "system", "content": "Output ONLY one concise standalone question."},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": prompt_text},
             ],
+            add_generation_prompt=True,
+        )
+        raw = self._runner.complete_text(
+            prompt,
             max_tokens=self.settings.max_router_tokens,
             temperature=0.0,
+            extra_args={"generation_mode": "text"},
         )
         return raw.strip() or user_text.strip() or "(banking question)"
 
@@ -1212,7 +1517,7 @@ class VllmStreamingConversationSession:
                     slots_per_sec=d_out.slots_per_sec,
                 )
 
-            # Router chose DELEGATE -> cancel speculative direct generation & dispatch query now.
+            # Router chose DELEGATE -> abort speculative direct generation & dispatch query now.
             spec_cancel.set()
             if query:
                 on_event({"type": "delegation_query_ready", "query": query})
@@ -1259,16 +1564,24 @@ class VllmStreamingConversationSession:
         )
 
 
+# ---------------------------------------------------------------------------
+# Engine Lifecycle Wrapper
+# ---------------------------------------------------------------------------
+
+
 class VllmOmniEngine:
-    """Thread-safe HTTP/SSE client engine targeting a running `vllm serve --omni` server."""
+    """Thread-safe in-process engine managing native `vllm_omni.AsyncOmni`."""
 
     def __init__(
         self,
         settings: EngineSettings,
-        transport: Optional[httpx.BaseTransport] = None,
+        omni_client: Optional[Any] = None,
+        tokenizer: Optional[Any] = None,
     ) -> None:
         self.settings = settings
-        self._transport = transport
+        self._injected_omni = omni_client
+        self._injected_tokenizer = tokenizer
+        self._runner: Optional[_NativeOmniRunner] = None
         self._executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="vllm-lfm3"
         )
@@ -1280,50 +1593,87 @@ class VllmOmniEngine:
     def is_loaded(self) -> bool:
         return self._loaded
 
-    def _make_client(self) -> httpx.Client:
-        headers: dict[str, str] = {}
-        if self.settings.vllm_api_key:
-            headers["Authorization"] = f"Bearer {self.settings.vllm_api_key}"
-        return httpx.Client(
-            base_url=self.settings.vllm_base_url.rstrip("/"),
-            timeout=httpx.Timeout(self.settings.vllm_timeout_sec, connect=10.0),
-            headers=headers,
-            transport=self._transport,
+    def _resolve_model_dir(self) -> str:
+        env_dir = os.environ.get("VLLM_LOCAL_MODEL_DIR", "").strip()
+        if env_dir and Path(env_dir).exists():
+            return env_dir
+        if Path(self.settings.model_id).exists():
+            return self.settings.model_id
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(
+            repo_id=self.settings.model_id,
+            revision=self.settings.model_revision or None,
+        )
+
+    def _resolve_deploy_config(self) -> str:
+        cfg_path = Path(self.settings.vllm_deploy_config)
+        if cfg_path.exists():
+            return str(cfg_path)
+        repo_cfg = Path(__file__).resolve().parent.parent / self.settings.vllm_deploy_config
+        if repo_cfg.exists():
+            return str(repo_cfg)
+        raise FileNotFoundError(
+            f"vLLM-Omni deploy config not found: {self.settings.vllm_deploy_config}"
         )
 
     def load(self) -> None:
-        """Verify reachability of the vLLM-Omni OpenAI API server (`GET /v1/models`)."""
+        """Initialize `AsyncOmni` + `AutoTokenizer` natively in-process and run warmup."""
         with self._load_lock:
             if self._loaded:
                 return
             t0 = time.perf_counter()
-            last_exc: Optional[Exception] = None
-            max_attempts = 1 if self._transport is not None else 15
-            for attempt in range(max_attempts):
-                try:
-                    with self._make_client() as client:
-                        resp = client.get("/v1/models")
-                        resp.raise_for_status()
-                        data = resp.json()
-                    models = [m.get("id", "") for m in (data.get("data") or []) if m.get("id")]
-                    self.available_models = models
-                    self._loaded = True
-                    elapsed = time.perf_counter() - t0
-                    print(
-                        f"[VllmOmniEngine] Connected to {self.settings.vllm_base_url} "
-                        f"(models={models}) in {elapsed:.2f}s",
-                        flush=True,
-                    )
-                    return
-                except Exception as exc:
-                    last_exc = exc
-                    if attempt < max_attempts - 1:
-                        time.sleep(1.0)
-            raise RuntimeError(
-                f"Failed to connect to vLLM-Omni at {self.settings.vllm_base_url}: {last_exc}"
+            if self._injected_omni is not None and self._injected_tokenizer is not None:
+                self._runner = _NativeOmniRunner(
+                    self._injected_omni,
+                    self._injected_tokenizer,
+                    timeout_sec=self.settings.vllm_timeout_sec,
+                )
+                self.available_models = [self.settings.model_id]
+                self._loaded = True
+                return
+
+            from transformers import AutoTokenizer
+            from vllm_omni import AsyncOmni
+
+            model_dir = self._resolve_model_dir()
+            deploy_cfg = self._resolve_deploy_config()
+            tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+            omni = AsyncOmni(
+                model=model_dir,
+                trust_remote_code=True,
+                deploy_config=deploy_cfg,
+                async_chunk=True,
+                limit_mm_per_prompt={"audio": int(self.settings.vllm_max_audio_per_prompt)},
+            )
+            runner = _NativeOmniRunner(
+                omni,
+                tokenizer,
+                timeout_sec=self.settings.vllm_timeout_sec,
+            )
+            warmup_prompt = runner.build_prompt(
+                [{"role": "user", "content": "Hi"}],
+                add_generation_prompt=True,
+            )
+            runner.complete_text(
+                warmup_prompt,
+                max_tokens=2,
+                temperature=0.0,
+                extra_args={"generation_mode": "text"},
+            )
+            self._runner = runner
+            self.available_models = [self.settings.model_id]
+            self._loaded = True
+            elapsed = time.perf_counter() - t0
+            print(
+                f"[VllmOmniEngine] Loaded native AsyncOmni ({self.settings.model_id}) in {elapsed:.2f}s",
+                flush=True,
             )
 
     def shutdown(self) -> None:
+        if self._runner is not None:
+            self._runner.shutdown()
+            self._runner = None
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     def run_on_worker(
@@ -1334,7 +1684,8 @@ class VllmOmniEngine:
     def create_pipeline(self) -> VllmStreamingConversationSession:
         if not self._loaded:
             self.load()
+        assert self._runner is not None
         return VllmStreamingConversationSession(
-            client_factory=self._make_client,
+            runner=self._runner,
             settings=self.settings,
         )

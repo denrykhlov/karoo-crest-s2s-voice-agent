@@ -125,7 +125,10 @@ def run_server(config: VoiceAgentConfig, open_browser: bool = False) -> None:
     print(f"  Backend: {config.engine.backend}", flush=True)
     print(f"  Model  : {config.engine.model_id}", flush=True)
     if config.engine.backend == "vllm":
-        print(f"  vLLM   : {config.engine.vllm_base_url}", flush=True)
+        print(
+            f"  vLLM   : native AsyncOmni (deploy_config={config.engine.vllm_deploy_config})",
+            flush=True,
+        )
     if config.calls_dir:
         print(f"  Calls  : {Path(config.calls_dir).resolve()}", flush=True)
     print(f"  Studio : {url}\n", flush=True)

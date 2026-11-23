@@ -56,8 +56,8 @@ COPY voice_agent /app/voice_agent
 COPY deploy /app/deploy
 RUN chmod +x /app/deploy/start_runpod.sh
 
-# Build-time smoke verification: LFM3-Omni + vLLM backend import cleanly with zero MLX imports.
-RUN python3 -c "import sys; from vllm_omni.model_executor.models.lfm3_omni.model import Lfm3OmniForConditionalGeneration; from voice_agent.vllm_backend import VllmOmniEngine; assert 'mlx' not in sys.modules; print('OK:', Lfm3OmniForConditionalGeneration.__name__, VllmOmniEngine.__name__)"
+# Build-time smoke verification: LFM3-Omni + AsyncOmni + vLLM backend import cleanly with zero MLX imports.
+RUN python3 -c "import sys; from vllm_omni import AsyncOmni; from vllm_omni.model_executor.models.lfm3_omni.model import Lfm3OmniForConditionalGeneration; from voice_agent.vllm_backend import VllmOmniEngine; assert 'mlx' not in sys.modules; print('OK:', AsyncOmni.__name__, Lfm3OmniForConditionalGeneration.__name__, VllmOmniEngine.__name__)"
 
 EXPOSE 8000
 ENTRYPOINT []

@@ -470,6 +470,8 @@ def build_config(
     port: int = 8000,
     backend: str = "mlx",
     model_id: str | None = None,
+    model_revision: str | None = None,
+    vllm_deploy_config: str | None = None,
     vllm_base_url: str | None = None,
     vllm_api_key: str | None = None,
     default_voice: str = "naledi",
@@ -496,10 +498,20 @@ def build_config(
             else "LiquidAI/LFM3-Omni-2B-MLX-8bit"
         )
     )
+    resolved_model_revision = (
+        model_revision
+        or os.environ.get("MODEL_REVISION", "").strip()
+        or "21d75123f86c1f7ffb4bef1ea202710c4e7ebe67"
+    )
+    resolved_vllm_deploy_config = (
+        vllm_deploy_config
+        or os.environ.get("DEPLOY_CONFIG", "").strip()
+        or "deploy/lfm3_omni_runpod.yaml"
+    )
     resolved_vllm_url = (
         vllm_base_url
         or os.environ.get("VLLM_BASE_URL", "").strip()
-        or "http://127.0.0.1:8091"
+        or ""
     )
     resolved_vllm_key = vllm_api_key or os.environ.get("VLLM_API_KEY", "").strip() or None
 
@@ -539,6 +551,8 @@ def build_config(
         engine=EngineSettings(
             backend=resolved_backend,
             model_id=resolved_model_id,
+            model_revision=resolved_model_revision,
+            vllm_deploy_config=resolved_vllm_deploy_config,
             vllm_base_url=resolved_vllm_url,
             vllm_api_key=resolved_vllm_key,
             max_slots=max_slots,
@@ -575,12 +589,22 @@ def main() -> None:
         "--backend",
         default=os.environ.get("VOICE_BACKEND", "mlx"),
         choices=["mlx", "vllm"],
-        help="Inference backend: 'mlx' (macOS Apple Silicon) or 'vllm' (vLLM-Omni server)",
+        help="Inference backend: 'mlx' (macOS Apple Silicon) or 'vllm' (native vLLM-Omni AsyncOmni)",
+    )
+    parser.add_argument(
+        "--model-revision",
+        default=None,
+        help="HuggingFace model revision for --backend vllm",
+    )
+    parser.add_argument(
+        "--vllm-deploy-config",
+        default=None,
+        help="Path to vLLM-Omni deploy YAML when --backend vllm (default: deploy/lfm3_omni_runpod.yaml)",
     )
     parser.add_argument(
         "--vllm-url",
-        default=os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8091"),
-        help="Base URL of the vLLM-Omni server when --backend vllm (default: http://127.0.0.1:8091)",
+        default=os.environ.get("VLLM_BASE_URL"),
+        help="Deprecated compatibility flag (vllm backend now runs native AsyncOmni in-process)",
     )
     parser.add_argument(
         "--model",
@@ -660,6 +684,8 @@ def main() -> None:
         port=args.port,
         backend=args.backend,
         model_id=args.model,
+        model_revision=args.model_revision,
+        vllm_deploy_config=args.vllm_deploy_config,
         vllm_base_url=args.vllm_url,
         default_voice=args.voice,
         max_slots=args.max_slots,

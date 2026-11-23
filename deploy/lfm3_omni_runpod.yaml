@@ -1,6 +1,6 @@
 # LFM3-Omni CUDA runtime profile for Runpod (vllm-omni pinned to ca9398dc9f18b6536daa05fd1980e2e9d370ed4f).
 # Eager execution owns per-request convolution and streaming codec state.
-async_chunk: false
+async_chunk: true
 model_runner: v1
 dtype: bfloat16
 connectors:
