@@ -9,7 +9,7 @@ on:
       image_tag:
         description: "Semantic tag to push alongside sha-<short>"
         required: false
-        default: "v0.1.4"
+        default: "v0.1.5"
 
 jobs:
   build-and-push:
@@ -44,7 +44,7 @@ jobs:
         run: |
           OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           SHORT_SHA=$(git rev-parse --short=7 HEAD)
-          SEMANTIC_TAG="${INPUT_TAG:-v0.1.4}"
+          SEMANTIC_TAG="${INPUT_TAG:-v0.1.5}"
           echo "image=ghcr.io/${OWNER_LOWER}/karoo-crest-s2s-voice-agent" >> "$GITHUB_OUTPUT"
           echo "semantic_tag=${SEMANTIC_TAG}" >> "$GITHUB_OUTPUT"
           echo "sha_tag=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"

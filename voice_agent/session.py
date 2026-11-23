@@ -75,6 +75,8 @@ class CallSession:
         self._generating: bool = False
         self._drain_in_flight: bool = False
         self._active_task: Optional[asyncio.Task[None]] = None
+        self._active_delegation_task: Optional[asyncio.Task[DelegationResult]] = None
+        self._active_stream_state: Optional[dict[str, Any]] = None
         self._turn_lock = asyncio.Lock()
 
         self._agent_speaking: bool = False
@@ -82,6 +84,8 @@ class CallSession:
         self._recent_agent_text: str = ""
         self._last_assistant_turn: Optional[TurnRecord] = None
         self._last_assistant_turn_id: Optional[str] = None
+        self._post_gen_barge_in_turn_id: Optional[str] = None
+        self._mid_gen_barge_in_handled_turn_id: Optional[str] = None
         self._ui_user_turns: set[str] = set()
         self._closed: bool = False
 
@@ -588,6 +592,9 @@ class CallSession:
             elif et == "user_speech_start":
                 tid = ev["turn_id"]
                 self._ui_user_turns.add(tid)
+                if self._active_delegation_task and not self._active_delegation_task.done():
+                    self._cancel_event.set()
+                    self._active_delegation_task.cancel()
                 if self.recorder is not None:
                     self.recorder.record_event(
                         "user_speech_start", {"turn_id": tid, "text": ev["text"]}
@@ -665,13 +672,46 @@ class CallSession:
             await self._emit_context_stats()
             self._schedule_agent_response()
 
-    async def _handle_post_gen_barge_in(self) -> None:
+    async def _emit_immediate_barge_in(
+        self, stream_state: Optional[dict[str, Any]] = None
+    ) -> None:
+        """Immediately silence browser playback without waiting for backend unwind."""
+        self._agent_speaking = False
+        if stream_state is not None:
+            if stream_state.get("barge_in_sent"):
+                return
+            stream_state["barge_in_sent"] = True
+        await self._send_json({"type": "barge_in"})
+
+    def _schedule_queued_pcm_drain(self) -> None:
+        """Kick off `_drain_live_pcm_loop` if live audio buffered up during generation."""
+        if (
+            not self.call_active
+            or self._closed
+            or self._generating
+            or self._drain_in_flight
+            or self.input_mode != "live"
+            or self.muted
+        ):
+            return
+        with self._pcm_lock:
+            has_queued = len(self._pcm_buffer) >= 10240
+        if has_queued:
+            self._drain_in_flight = True
+            asyncio.create_task(self._drain_live_pcm_loop())
+
+    async def _handle_post_gen_barge_in(self, *, send_barge_in: bool = True) -> None:
         """Roll back `conv_cache` when user interrupts after generation finished."""
         t0 = time.perf_counter()
+        self._cancel_event.set()
         played_frames = self._played_samples_24k // 1920
         prev_turn_id = self._last_assistant_turn_id
+        self._post_gen_barge_in_turn_id = prev_turn_id
         self._agent_speaking = False
-        await self._send_json({"type": "barge_in"})
+        if self._active_delegation_task and not self._active_delegation_task.done():
+            self._active_delegation_task.cancel()
+        if send_barge_in:
+            await self._emit_immediate_barge_in(self._active_stream_state)
 
         truncated = None
         if self.pipeline is not None:
@@ -721,15 +761,34 @@ class CallSession:
 
     async def _trigger_external_barge_in(self) -> None:
         """Cancel active generation/playback for PTT or typed-text interruption."""
+        was_speaking = self._agent_speaking
+        was_generating = self._generating
+        active_turn_id = self._last_assistant_turn_id
+        had_delegation = (
+            self._active_delegation_task is not None
+            and not self._active_delegation_task.done()
+        )
+        already_sent = False
         self._cancel_event.set()
+        if was_speaking or was_generating or had_delegation:
+            await self._emit_immediate_barge_in(self._active_stream_state)
+            already_sent = True
+        if self._active_delegation_task and not self._active_delegation_task.done():
+            self._active_delegation_task.cancel()
         if self._active_task and not self._active_task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(self._active_task), timeout=5.0)
             except Exception:
                 self._active_task.cancel()
         self._active_task = None
-        if self._agent_speaking:
-            await self._handle_post_gen_barge_in()
+        if (
+            was_speaking
+            and active_turn_id is not None
+            and self._mid_gen_barge_in_handled_turn_id != active_turn_id
+            and self._post_gen_barge_in_turn_id != active_turn_id
+            and self._last_assistant_turn_id == active_turn_id
+        ):
+            await self._handle_post_gen_barge_in(send_barge_in=not already_sent)
 
     async def _init_call_state(self, ringing: bool = True) -> None:
         await self._trigger_external_barge_in()
@@ -753,6 +812,10 @@ class CallSession:
         self._recent_agent_text = ""
         self._last_assistant_turn = None
         self._last_assistant_turn_id = None
+        self._active_delegation_task = None
+        self._active_stream_state = None
+        self._post_gen_barge_in_turn_id = None
+        self._mid_gen_barge_in_handled_turn_id = None
         self._ui_user_turns.clear()
         self.crm_state = self._empty_crm_state()
         self.stats.reset()
@@ -1046,6 +1109,11 @@ class CallSession:
                 self._recent_agent_text = ev.get("text", "")
             self.loop.call_soon_threadsafe(event_queue.put_nowait, ev)
 
+        stream_state["_trigger_barge_in_ui"] = (
+            lambda: self.loop.call_soon_threadsafe(
+                event_queue.put_nowait, {"type": "_barge_in_immediate"}
+            )
+        )
         self._generating = True
         future = self.engine.run_on_worker(worker_fn, *args_builder(on_engine_event))
         future.add_done_callback(
@@ -1057,9 +1125,12 @@ class CallSession:
                 ev = await event_queue.get()
                 if ev is None:
                     break
+                ev_type = ev.get("type")
+                if ev_type == "_barge_in_immediate":
+                    await self._emit_immediate_barge_in(stream_state)
+                    continue
                 if cancel_ev.is_set():
                     continue
-                ev_type = ev.get("type")
                 if ev_type == "delegation_query_ready":
                     q_text = str(ev.get("query") or "")
                     if self.recorder is not None and q_text:
@@ -1167,6 +1238,7 @@ class CallSession:
 
             return await asyncio.wrap_future(future, loop=self.loop)
         finally:
+            stream_state.pop("_trigger_barge_in_ui", None)
             self._generating = False
 
     async def _handle_mid_gen_barge_in(
@@ -1180,8 +1252,11 @@ class CallSession:
     ) -> None:
         """Rollback conv_cache, record interrupted metrics & cancel latency, forward events."""
         t0 = time.perf_counter()
-        self._agent_speaking = False
-        await self._send_json({"type": "barge_in"})
+        self._mid_gen_barge_in_handled_turn_id = turn_id
+        if not stream_state.get("barge_in_sent"):
+            await self._emit_immediate_barge_in(stream_state)
+        else:
+            self._agent_speaking = False
         played_frames = max(0, (self._played_samples_24k // 1920) - int(filler_frames))
         trunc_disp: Optional[str] = None
         prefix = stream_state.get("filler_prefix", "")
@@ -1480,10 +1555,12 @@ class CallSession:
         self._last_assistant_turn_id = turn_id
 
         mid_gen_mic_events: list[dict[str, Any]] = []
+        mic_ev_lock = threading.Lock()
         stream_state: dict[str, Any] = {
             "t_turn_start": t_turn_start,
             "turn_started_ui": False,
             "speech_started_ui": False,
+            "barge_in_sent": False,
             "first_token_ts": None,
             "first_audio_ts": None,
             "chunks_sent": 0,
@@ -1491,6 +1568,7 @@ class CallSession:
             "filler_prefix": "",
             "display_text": "",
         }
+        self._active_stream_state = stream_state
         delegation_task: Optional[asyncio.Task[DelegationResult]] = None
         filler_frames_count = 0
 
@@ -1506,7 +1584,14 @@ class CallSession:
                 recent_agent_text=self._recent_agent_text,
                 patience=self.patience,
             )
-            mid_gen_mic_events.extend(evs)
+            if evs:
+                with mic_ev_lock:
+                    mid_gen_mic_events.extend(evs)
+                if any(ev.get("type") == "barge_in_detected" for ev in evs):
+                    cancel_ev.set()
+                    cb = stream_state.get("_trigger_barge_in_ui")
+                    if callable(cb):
+                        cb()
             return evs
 
         def start_delegation_async(q: str) -> None:
@@ -1520,6 +1605,7 @@ class CallSession:
                 delegation_task = asyncio.create_task(
                     self.delegate.query(q, self.language)
                 )
+                self._active_delegation_task = delegation_task
 
         endpoint_ms = self._last_endpoint_ms
         self._last_endpoint_ms = None
@@ -1631,7 +1717,7 @@ class CallSession:
                             stream_state,
                             plan.filler_turn,
                             mid_gen_mic_events,
-                            filler_frames=plan.filler_audio_frames,
+                            filler_frames=0,
                             turn_ctx=turn_ctx,
                         )
                         return
@@ -1653,17 +1739,38 @@ class CallSession:
                 if delegation_task is None:
                     start_delegation_async(query_text)
                 assert delegation_task is not None
-                del_res = await delegation_task
-                if cancel_ev.is_set():
+                self._last_assistant_turn_id = turn_id
+                if plan and plan.filler_turn:
+                    self._last_assistant_turn = plan.filler_turn
+                self._schedule_queued_pcm_drain()
+                try:
+                    del_res = await delegation_task
+                except asyncio.CancelledError:
+                    if self._post_gen_barge_in_turn_id == turn_id:
+                        return
                     await self._handle_mid_gen_barge_in(
                         turn_id,
                         stream_state,
                         plan.filler_turn if plan else None,
                         mid_gen_mic_events,
-                        filler_frames=filler_frames_count,
+                        filler_frames=0,
                         turn_ctx=turn_ctx,
                     )
                     return
+                if cancel_ev.is_set() or self._post_gen_barge_in_turn_id == turn_id:
+                    if self._post_gen_barge_in_turn_id == turn_id:
+                        return
+                    await self._handle_mid_gen_barge_in(
+                        turn_id,
+                        stream_state,
+                        plan.filler_turn if plan else None,
+                        mid_gen_mic_events,
+                        filler_frames=0,
+                        turn_ctx=turn_ctx,
+                    )
+                    return
+                self._last_assistant_turn = None
+                self._last_assistant_turn_id = None
 
                 delegation_ms = round(del_res.latency_ms, 1)
                 delegation_source = del_res.source
@@ -1693,6 +1800,7 @@ class CallSession:
                     ),
                     loop=self.loop,
                 )
+                self._last_assistant_turn_id = turn_id
                 ans_t0 = time.perf_counter()
                 final_outcome = await self._run_worker_stream(
                     pipeline.generate_assistant_turn,
@@ -1751,7 +1859,7 @@ class CallSession:
                         stream_state,
                         plan.filler_turn,
                         mid_gen_mic_events,
-                        filler_frames=plan.filler_audio_frames,
+                        filler_frames=0,
                         turn_ctx=turn_ctx,
                     )
                     return
@@ -1792,17 +1900,38 @@ class CallSession:
                     if delegation_task is None:
                         start_delegation_async(query_text)
                     assert delegation_task is not None
-                    del_res = await delegation_task
-                    if cancel_ev.is_set():
+                    self._last_assistant_turn_id = turn_id
+                    if plan and plan.filler_turn:
+                        self._last_assistant_turn = plan.filler_turn
+                    self._schedule_queued_pcm_drain()
+                    try:
+                        del_res = await delegation_task
+                    except asyncio.CancelledError:
+                        if self._post_gen_barge_in_turn_id == turn_id:
+                            return
                         await self._handle_mid_gen_barge_in(
                             turn_id,
                             stream_state,
                             plan.filler_turn,
                             mid_gen_mic_events,
-                            filler_frames=filler_frames_count,
+                            filler_frames=0,
                             turn_ctx=turn_ctx,
                         )
                         return
+                    if cancel_ev.is_set() or self._post_gen_barge_in_turn_id == turn_id:
+                        if self._post_gen_barge_in_turn_id == turn_id:
+                            return
+                        await self._handle_mid_gen_barge_in(
+                            turn_id,
+                            stream_state,
+                            plan.filler_turn,
+                            mid_gen_mic_events,
+                            filler_frames=0,
+                            turn_ctx=turn_ctx,
+                        )
+                        return
+                    self._last_assistant_turn = None
+                    self._last_assistant_turn_id = None
 
                     delegation_ms = round(del_res.latency_ms, 1)
                     delegation_source = del_res.source
@@ -1832,6 +1961,7 @@ class CallSession:
                         ),
                         loop=self.loop,
                     )
+                    self._last_assistant_turn_id = turn_id
                     ans_t0 = time.perf_counter()
                     final_outcome = await self._run_worker_stream(
                         pipeline.generate_assistant_turn,
@@ -1877,6 +2007,11 @@ class CallSession:
             await self._send_json({"type": "error", "message": f"Inference error: {exc}"})
             await self._send_json({"type": "call_state", "state": "listening"})
             return
+        finally:
+            self._active_stream_state = None
+            if self._active_delegation_task is delegation_task:
+                self._active_delegation_task = None
+            self._schedule_queued_pcm_drain()
 
         if final_outcome is None:
             return
@@ -2039,12 +2174,7 @@ class CallSession:
             self._agent_speaking = False
             await self._send_json({"type": "call_state", "state": "listening"})
 
-        # Drain any PCM that queued right as generation finished.
-        with self._pcm_lock:
-            has_queued = len(self._pcm_buffer) >= 10240
-        if has_queued and not self._drain_in_flight and self.input_mode == "live":
-            self._drain_in_flight = True
-            asyncio.create_task(self._drain_live_pcm_loop())
+        self._schedule_queued_pcm_drain()
 
     def _update_crm_state(
         self, fn_name: str, args: dict[str, Any], result: dict[str, Any]

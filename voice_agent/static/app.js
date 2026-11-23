@@ -8,6 +8,7 @@
     callState: "idle",
     muted: false,
     inputMode: "live", // "live" | "ptt"
+    acceptingAudio: false,
     audioCtx: null,
     micStream: null,
     captureNode: null,
@@ -304,6 +305,9 @@
 
   function handleIncomingAudio(arrayBuffer) {
     stopRingtone();
+    if (!state.acceptingAudio) {
+      return;
+    }
     if (state.playbackNode) {
       state.playbackNode.port.postMessage(
         { type: "audio", buffer: arrayBuffer },
@@ -352,6 +356,7 @@
 
       case "barge_in":
         stopRingtone();
+        state.acceptingAudio = false;
         state.agentRms = 0;
         if (state.playbackNode) {
           state.playbackNode.port.postMessage({ type: "clear" });
@@ -369,6 +374,7 @@
 
       case "assistant_turn_start":
         ensureFeedStarted();
+        state.acceptingAudio = true;
         if (state.playbackNode) {
           state.playbackNode.port.postMessage({ type: "new_turn", turnId: msg.turn_id });
         }
@@ -725,6 +731,7 @@
 
   function stopCallMedia() {
     state.callActive = false;
+    state.acceptingAudio = false;
     stopRingtone();
     clearInterval(state.timerInterval);
     state.agentRms = 0;

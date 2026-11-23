@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import threading
+import time
 import wave
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -190,7 +191,9 @@ class FakeAsyncOmni:
         self.filler_text: str = "Let me check our policy details for you right away."
         self.summary_text: str = "Customer asked about Ubuntu Rewards Platinum annual fee."
         self.stream_delay_s: float = 0.0
+        self.tts_stream_delay_s: float = 0.0
         self.stream_chunks: int = 2
+        self.audio_on_all_steps: bool = False
 
     async def abort(self, request_id: str | list[str]) -> None:
         ids = [request_id] if isinstance(request_id, str) else list(request_id)
@@ -228,6 +231,7 @@ class FakeAsyncOmni:
                     "request_id": request_id,
                     "rendered": rendered,
                     "multi_modal_data": prompt.get("multi_modal_data"),
+                    "mm_processor_kwargs": prompt.get("mm_processor_kwargs"),
                     "sampling_params_list": sampling_params_list,
                     "output_modalities": list(output_modalities or []),
                 }
@@ -239,8 +243,10 @@ class FakeAsyncOmni:
             audio_val = mm.get("audio")
             assert isinstance(audio_val, tuple) and audio_val[1] == 16000
             assert isinstance(audio_val[0], np.ndarray) and audio_val[0].dtype == np.float32
-            assert "<|im_start|>assistant\n<|vision_start|><|audio|><|vision_end|>" in rendered
-            assert rendered.endswith("<|vision_end|>")
+            assert "<think>" not in rendered
+            assert "<|vision_start|>" not in rendered and "<|vision_end|>" not in rendered
+            assert rendered.endswith("<|im_start|>assistant\n<|audio|>")
+            assert prompt.get("mm_processor_kwargs") == {"audio_markers": False}
             with self.lock:
                 if self.asr_idx < len(self.asr_sequence):
                     text = self.asr_sequence[self.asr_idx]
@@ -307,6 +313,30 @@ class FakeAsyncOmni:
         if "<|im_start|>system\nPerform TTS in " in rendered:
             assert rendered.endswith("<|audio_start|>")
             assert output_modalities == ["audio"]
+            tts_delay = (
+                self.tts_stream_delay_s if self.tts_stream_delay_s > 0 else self.stream_delay_s
+            )
+            if tts_delay > 0:
+                total_tts_steps = max(2, self.stream_chunks)
+                for step_idx in range(total_tts_steps):
+                    await asyncio.sleep(tts_delay)
+                    if self._is_aborted(request_id):
+                        return
+                    yield FakeOmniRequestOutput(
+                        request_id=request_id,
+                        stage_id=1,
+                        final_output_type="audio",
+                        outputs=[
+                            FakeCompletionOutput(
+                                text="",
+                                multimodal_output=_FakeMultimodalPayload(
+                                    {"model_outputs": [_FakeTensor(_pcm16_24k_sine(frames=2))]}
+                                ),
+                            )
+                        ],
+                        finished=(step_idx == total_tts_steps - 1),
+                    )
+                return
             # Emit metadata-only empty chunks first, then `model_outputs` via non-dict Mapping
             yield FakeOmniRequestOutput(
                 request_id=request_id,
@@ -412,7 +442,7 @@ class FakeAsyncOmni:
                         ],
                         finished=False,
                     )
-                if step_idx < 2:
+                if step_idx < 2 or self.audio_on_all_steps:
                     wav = _pcm16_24k_sine(frames=2, amplitude=0.05 + 0.02 * step_idx)
                     yield FakeOmniRequestOutput(
                         request_id=request_id,
@@ -992,5 +1022,348 @@ def test_vllm_call_session_websocket_e2e_and_metrics(
             txt = (call_dir / "transcript.txt").read_text(encoding="utf-8")
             assert "TTFT:" in txt
             assert "TTFA:" in txt
+    finally:
+        engine.shutdown()
+
+
+def test_vllm_live_s2s_sliding_window_160s() -> None:
+    """LiveASR maintains 960 ms overlap + 640 ms new block = 1.60 s O(1) sliding window."""
+    omni = FakeAsyncOmni()
+    omni.asr_sequence = ["", "", ""]
+    tok = FakeTokenizer()
+    engine = VllmOmniEngine(
+        EngineSettings(backend="vllm", model_id="LiquidAI/LFM3-Omni-2B"),
+        omni_client=omni,
+        tokenizer=tok,
+    )
+    engine.load()
+    try:
+        sess = engine.create_pipeline()
+        sess.initialize_conversation("Sys prompt.", tools=None, language="en")
+        block = _pcm16_16k_speech_block(blocks=1)  # 10,240 samples (640 ms)
+
+        sess.ingest_pcm_and_listen(block, patience="balanced")
+        sess.ingest_pcm_and_listen(block, patience="balanced")
+        sess.ingest_pcm_and_listen(block, patience="balanced")
+
+        asr_calls = [
+            c for c in omni.calls if "<|im_start|>system\nPerform live ASR.<|im_end|>" in c["rendered"]
+        ]
+        assert len(asr_calls) == 3
+        lengths = [len(c["multi_modal_data"]["audio"][0]) for c in asr_calls]
+        assert lengths == [10240, 20480, 25600]
+    finally:
+        engine.shutdown()
+
+
+def test_vllm_tts_fallback_mid_gen_barge_in() -> None:
+    """Mid-gen voice barge-in aborts active `_stream_tts_fallback` streaming cleanly."""
+    omni = FakeAsyncOmni()
+    omni.omit_chat_audio = True
+    omni.stream_delay_s = 0.0
+    omni.tts_stream_delay_s = 0.08
+    omni.stream_chunks = 10
+    omni.asr_sequence = ["Hold on a second."]
+    tok = FakeTokenizer()
+    cfg = build_config(backend="vllm", calls_dir="")
+    engine = VllmOmniEngine(cfg.engine, omni_client=omni, tokenizer=tok)
+    engine.load()
+    persona = next(p for p in build_personas() if p.id == "naledi")
+    try:
+        sess = engine.create_pipeline()
+        sess.initialize_conversation(persona.system_prompt, tools=None, language="en")
+        sess.append_text_user_turn("Tell me about monthly fees.")
+        hist_before = len(sess.history)
+
+        cancel_ev = threading.Event()
+        mic_block = _pcm16_16k_speech_block(blocks=1)
+        poll_count = 0
+
+        def poll_mic() -> list[dict[str, Any]]:
+            nonlocal poll_count
+            poll_count += 1
+            return sess.ingest_pcm_and_listen(
+                mic_block,
+                agent_speaking=True,
+                recent_agent_text=omni.answer_text,
+                patience="snappy",
+            )
+
+        out = sess.generate_assistant_turn(
+            persona=persona,
+            tools=None,
+            force_interleaved=False,
+            cancel_event=cancel_ev,
+            on_event=lambda _e: None,
+            poll_mic_fn=poll_mic,
+        )
+        assert poll_count >= 1
+        assert cancel_ev.is_set()
+        assert out.cancelled is True
+        assert out.kind == "cancelled"
+        assert out.used_tts_fallback is True
+        assert len(omni.aborted_ids) >= 1
+        # Cancelled turn must not be appended verbatim to history; rollback inserts truncated portion.
+        assert len(sess.history) == hist_before
+    finally:
+        engine.shutdown()
+
+
+def test_vllm_websocket_mid_gen_voice_barge_in_immediate_and_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Voice barge-in mid-generation emits `barge_in` immediately and rolls back direct turn."""
+    monkeypatch.delenv("FLAMETREE_AGENT_TOKEN", raising=False)
+    omni = FakeAsyncOmni()
+    omni.router_decision = "DIRECT"
+    omni.answer_text = (
+        "We offer Ubuntu Classic Gold and Protea Platinum credit cards "
+        "with cashback rewards and airport lounge visits."
+    )
+    tok = FakeTokenizer()
+    calls_dir = tmp_path / "calls"
+
+    cfg = build_config(
+        backend="vllm",
+        language="en",
+        delegation_mode="selective_tool",
+        calls_dir=str(calls_dir),
+    )
+    engine = VllmOmniEngine(cfg.engine, omni_client=omni, tokenizer=tok)
+    engine.load()
+    try:
+        app = create_app(cfg, engine=engine, load_on_startup=False)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/call") as ws:
+                assert ws.receive_json() == {"type": "call_state", "state": "idle"}
+                ws.send_json({"type": "start_call", "language": "en"})
+
+                call_id = ""
+                for _ in range(200):
+                    msg = ws.receive()
+                    if msg.get("text") is not None:
+                        ev = json.loads(msg["text"])
+                        if ev.get("type") == "call_started":
+                            call_id = ev["call_id"]
+                        elif ev.get("type") == "delivery_stats" and ev.get("stats", {}).get("turn_count", 0) >= 1:
+                            break
+                assert call_id
+                ws.send_json({"type": "playback_done", "played_samples": 4 * 1920})
+
+                # Slow Turn 2 streaming so caller voice audio catches Turn 2 mid-generation.
+                omni.stream_delay_s = 0.08
+                omni.stream_chunks = 14
+                omni.audio_on_all_steps = True
+                omni.asr_idx = 0
+                omni.asr_sequence = ["Hold on please.", ""]
+
+                saw_turn2_start = False
+                sent_voice = False
+                saw_barge_in = False
+                saw_turn2_end = False
+                saw_truncated = False
+                turn3_done = False
+
+                ws.send_json({"type": "user_text", "text": "Tell me everything about the cards."})
+
+                for _ in range(400):
+                    msg = ws.receive()
+                    if msg.get("bytes") is not None:
+                        if not saw_turn2_start:
+                            continue
+                        if not sent_voice:
+                            sent_voice = True
+                            ws.send_json({"type": "playback_progress", "played_samples": 3 * 1920})
+                            ws.send_bytes(_pcm16_16k_speech_block(blocks=1))
+                    elif msg.get("text") is not None:
+                        ev = json.loads(msg["text"])
+                        t = ev.get("type")
+                        if t == "assistant_turn_start":
+                            saw_turn2_start = True
+                            continue
+                        if not saw_turn2_start:
+                            continue
+                        if t == "barge_in":
+                            saw_barge_in = True
+                            assert not saw_turn2_end, "Turn 2 completed instead of being interrupted mid-gen"
+                            # Finish utterance with silence so "Hold on please." commits cleanly for Turn 3.
+                            omni.stream_delay_s = 0.0
+                            omni.audio_on_all_steps = False
+                            silence_block = b"\x00" * 20480
+                            ws.send_bytes(silence_block)
+                            ws.send_bytes(silence_block)
+                        elif t == "assistant_turn_truncated":
+                            saw_truncated = True
+                            assert ev.get("text", "").endswith("...")
+                        elif t == "assistant_turn_end":
+                            if not saw_barge_in:
+                                saw_turn2_end = True
+                            else:
+                                turn3_done = True
+                        elif (
+                            t == "delivery_stats"
+                            and saw_barge_in
+                            and turn3_done
+                            and ev.get("stats", {}).get("turn_count", 0) >= 3
+                        ):
+                            break
+
+                assert saw_barge_in is True
+                assert saw_truncated is True
+                assert turn3_done is True
+
+                ws.send_json({"type": "hang_up"})
+                for _ in range(40):
+                    msg = ws.receive()
+                    if msg.get("text") is not None:
+                        ev = json.loads(msg["text"])
+                        if ev.get("type") == "call_state" and ev.get("state") == "idle":
+                            break
+
+            detail = client.get(f"/api/calls/{call_id}").json()
+            assert detail["metadata"]["counts"]["error_count"] == 0
+            trace_events = detail["trace_events"]
+            mid_bis = [t for t in trace_events if t.get("event") == "barge_in_mid_gen"]
+            assert len(mid_bis) >= 1
+            assert mid_bis[0]["data"]["played_frames"] == 3
+            assert mid_bis[0]["data"]["truncated_text"]
+    finally:
+        engine.shutdown()
+
+
+def test_vllm_barge_in_during_delegation_wait_cancels_delegation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Caller speech while awaiting Flametree delegation cancels delegation and suppresses stale answer."""
+    from voice_agent.delegation import DelegationResult
+
+    class _SlowCancellingDelegate:
+        def __init__(self) -> None:
+            self.is_live = False
+            self.last_error: str | None = None
+            self.current_session_id: str | None = None
+            self.call_num = 0
+            self.started_first = threading.Event()
+            self.cancelled_calls = 0
+
+        async def start_session(self, call_id: str, language: str) -> str | None:
+            return None
+
+        async def close_session(self) -> None:
+            return None
+
+        async def query(self, question: str, language: str) -> DelegationResult:
+            self.call_num += 1
+            if self.call_num == 1:
+                self.started_first.set()
+                try:
+                    await asyncio.sleep(5.0)
+                except asyncio.CancelledError:
+                    self.cancelled_calls += 1
+                    raise
+            return DelegationResult(
+                query=question,
+                answer="Ubuntu Gold costs R95 per month.",
+                source="stub_kb",
+                latency_ms=1.0,
+            )
+
+    delegate_stub = _SlowCancellingDelegate()
+    monkeypatch.delenv("FLAMETREE_AGENT_TOKEN", raising=False)
+    monkeypatch.setattr("voice_agent.session.build_delegate", lambda _cfg: delegate_stub)
+
+    omni = FakeAsyncOmni()
+    tok = FakeTokenizer()
+    calls_dir = tmp_path / "calls"
+    cfg = build_config(
+        backend="vllm",
+        language="en",
+        delegation_mode="always_delegate",
+        dynamic_filler=True,
+        calls_dir=str(calls_dir),
+    )
+    engine = VllmOmniEngine(cfg.engine, omni_client=omni, tokenizer=tok)
+    engine.load()
+    try:
+        app = create_app(cfg, engine=engine, load_on_startup=False)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/call") as ws:
+                assert ws.receive_json() == {"type": "call_state", "state": "idle"}
+                ws.send_json({"type": "start_call", "language": "en"})
+
+                call_id = ""
+                for _ in range(200):
+                    msg = ws.receive()
+                    if msg.get("text") is not None:
+                        ev = json.loads(msg["text"])
+                        if ev.get("type") == "call_started":
+                            call_id = ev["call_id"]
+                        elif ev.get("type") == "delivery_stats" and ev.get("stats", {}).get("turn_count", 0) >= 1:
+                            break
+                assert call_id
+                ws.send_json({"type": "playback_done", "played_samples": 4 * 1920})
+
+                # Trigger Turn 2 delegation: filler finishes quickly, leaving session awaiting `delegation_task`.
+                omni.asr_idx = 0
+                omni.asr_sequence = ["Never mind, stop.", ""]
+                ws.send_json({"type": "user_text", "text": "What are the Platinum lounge rules?"})
+
+                # Wait for Turn 2 filler live_ttfa & delegate task entry while awaiting `delegation_task`.
+                saw_turn2_start = False
+                saw_turn2_filler_ttfa = False
+                for _ in range(200):
+                    msg = ws.receive()
+                    if msg.get("text") is not None:
+                        ev = json.loads(msg["text"])
+                        t = ev.get("type")
+                        if t == "assistant_turn_start":
+                            saw_turn2_start = True
+                        elif t == "live_ttfa" and saw_turn2_start:
+                            saw_turn2_filler_ttfa = True
+                            break
+                assert saw_turn2_filler_ttfa
+                assert delegate_stub.started_first.wait(timeout=5.0)
+                time.sleep(0.05)
+
+                # Interrupt while waiting on `delegation_task`.
+                ws.send_bytes(_pcm16_16k_speech_block(blocks=1))
+
+                delegation_events: list[dict[str, Any]] = []
+                barge_ins = 0
+                turn3_completed = False
+                for _ in range(300):
+                    msg = ws.receive()
+                    if msg.get("text") is not None:
+                        ev = json.loads(msg["text"])
+                        t = ev.get("type")
+                        if t == "barge_in":
+                            barge_ins += 1
+                            silence_block = b"\x00" * 20480
+                            ws.send_bytes(silence_block)
+                            ws.send_bytes(silence_block)
+                        elif t == "delegation_event":
+                            delegation_events.append(ev)
+                        elif t == "assistant_turn_end" and barge_ins >= 1:
+                            turn3_completed = True
+                            break
+
+                assert barge_ins >= 1
+                assert turn3_completed is True
+                assert delegate_stub.cancelled_calls == 1
+                # Only Turn 3 ("Never mind, stop.") could emit a delegation_event; Turn 2 was cancelled.
+                assert all("Platinum lounge" not in (d.get("query") or "") for d in delegation_events)
+
+                ws.send_json({"type": "hang_up"})
+                for _ in range(40):
+                    msg = ws.receive()
+                    if msg.get("text") is not None:
+                        ev = json.loads(msg["text"])
+                        if ev.get("type") == "call_state" and ev.get("state") == "idle":
+                            break
+
+            detail = client.get(f"/api/calls/{call_id}").json()
+            assert detail["metadata"]["counts"]["error_count"] == 0
     finally:
         engine.shutdown()

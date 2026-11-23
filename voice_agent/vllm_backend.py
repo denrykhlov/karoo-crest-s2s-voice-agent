@@ -172,7 +172,7 @@ def _dedup_overlap_delta(prev_text: str, new_text: str) -> str:
     if not prev_words or not norm_new_words:
         return new_clean
 
-    max_k = min(len(prev_words), len(norm_new_words), 6)
+    max_k = min(len(prev_words), len(norm_new_words), 10)
     overlap_k = 0
     for k in range(max_k, 0, -1):
         if prev_words[-k:] == norm_new_words[:k]:
@@ -285,6 +285,21 @@ class _NativeOmniRunner:
                 "audio": clips[0] if len(clips) == 1 else clips
             }
         return prompt
+
+    def build_live_asr_prompt(self, wav_f32: np.ndarray) -> dict[str, Any]:
+        """Build native LFM3 assistant-turn LiveASR prompt (`<|audio|>` without `<think>` or vision spans)."""
+        rendered = (
+            "<|startoftext|><|im_start|>system\nPerform live ASR.<|im_end|>\n"
+            "<|im_start|>assistant\n<|audio|>"
+        )
+        prompt_ids = list(self.tokenizer.encode(rendered, add_special_tokens=False))
+        return {
+            "prompt_token_ids": prompt_ids,
+            "multi_modal_data": {
+                "audio": (np.asarray(wav_f32, dtype=np.float32).reshape(-1), 16000)
+            },
+            "mm_processor_kwargs": {"audio_markers": False},
+        }
 
     def build_sampling_params_list(
         self,
@@ -447,7 +462,7 @@ class _NativeOmniRunner:
                 if (
                     poll_barge_in is not None
                     and not cancel_event.is_set()
-                    and (now - last_poll >= 0.50)
+                    and (now - last_poll >= 0.32)
                 ):
                     last_poll = now
                     poll_barge_in()
@@ -473,8 +488,9 @@ class _NativeOmniRunner:
                 elif kind == "audio":
                     on_audio_pcm(payload)
 
+            join_timeout = 1.5 if cancel_event.is_set() else 5.0
             try:
-                pump_fut.result(timeout=5.0)
+                pump_fut.result(timeout=join_timeout)
             except Exception:
                 if not cancel_event.is_set():
                     raise
@@ -522,7 +538,7 @@ class VllmLiveS2SListener:
         idle_reset_sec: float = 15.0,
         hard_reset_sec: float = 30.0,
         block_bytes: int = 20480,  # 640 ms @ 16 kHz mono Int16
-        overlap_bytes: int = 20480,  # 640 ms left overlap (1.28 s O(1) window)
+        overlap_bytes: int = 30720,  # 960 ms left overlap (1.60 s O(1) window)
     ) -> None:
         self._runner = runner
         self.idle_reset_sec = float(idle_reset_sec)
@@ -553,24 +569,13 @@ class VllmLiveS2SListener:
             return ""
         window_pcm = self._prev_tail_pcm + pcm16_block
         self._prev_tail_pcm = (
-            pcm16_block[-self.overlap_bytes :] if self.overlap_bytes > 0 else b""
+            window_pcm[-self.overlap_bytes :] if self.overlap_bytes > 0 else b""
         )
         wav_f32 = _pcm16_to_float32(window_pcm)
-        prompt = self._runner.build_prompt(
-            [
-                {"role": "system", "content": "Perform live ASR."},
-                {
-                    "role": "assistant",
-                    "content": [{"type": "audio"}, {"type": "text", "text": ""}],
-                },
-            ],
-            audio_clips_16k=[wav_f32],
-            add_generation_prompt=False,
-            continue_final_message=True,
-        )
+        prompt = self._runner.build_live_asr_prompt(wav_f32)
         raw_text = self._runner.complete_text(
             prompt,
-            max_tokens=48,
+            max_tokens=32,
             temperature=0.0,
             extra_args={"generation_mode": "text"},
         )
@@ -626,6 +631,7 @@ class VllmStreamingConversationSession:
         self._pending_filler_text: str = ""
 
         self._pcm_buf = bytearray()
+        self._listen_lock = threading.Lock()
         self._pre_speech_blocks: deque[bytes] = deque(maxlen=settings.pre_speech_blocks)
         self.user_speaking: bool = False
         self.active_user_turn_id: Optional[str] = None
@@ -658,16 +664,17 @@ class VllmStreamingConversationSession:
         self.compaction_count = 0
         self._rolling_summary = ""
         self._pending_filler_text = ""
-        self._pcm_buf.clear()
-        self._pre_speech_blocks.clear()
-        self.user_speaking = False
-        self.active_user_turn_id = None
-        self.active_user_transcript = ""
-        self.active_user_pcm_blocks.clear()
-        self.empty_chunk_streak = 0
-        self.user_blocks_in_turn = 0
-        self.listener.reset_window()
-        self.listener.reset_count = 0
+        with self._listen_lock:
+            self._pcm_buf.clear()
+            self._pre_speech_blocks.clear()
+            self.user_speaking = False
+            self.active_user_turn_id = None
+            self.active_user_transcript = ""
+            self.active_user_pcm_blocks.clear()
+            self.empty_chunk_streak = 0
+            self.user_blocks_in_turn = 0
+            self.listener.reset_window()
+            self.listener.reset_count = 0
 
     def update_system_config(
         self,
@@ -769,123 +776,125 @@ class VllmStreamingConversationSession:
     ) -> list[dict[str, Any]]:
         if not pcm16_bytes:
             return []
-        self._pcm_buf.extend(pcm16_bytes)
-        events: list[dict[str, Any]] = []
-        bsize = self.listener.block_bytes
+        with self._listen_lock:
+            self._pcm_buf.extend(pcm16_bytes)
+            events: list[dict[str, Any]] = []
+            bsize = self.listener.block_bytes
 
-        while len(self._pcm_buf) >= bsize:
-            block = bytes(self._pcm_buf[:bsize])
-            del self._pcm_buf[:bsize]
+            while len(self._pcm_buf) >= bsize:
+                block = bytes(self._pcm_buf[:bsize])
+                del self._pcm_buf[:bsize]
 
-            delta_text = self.listener.step_block(block)
-            speech = has_real_speech(delta_text)
+                delta_text = self.listener.step_block(block)
+                speech = has_real_speech(delta_text)
 
-            if not self.user_speaking:
-                if speech:
-                    if agent_speaking and is_likely_agent_echo(
-                        delta_text, recent_agent_text, lang_code=self.language
-                    ):
-                        self._pre_speech_blocks.append(block)
-                        self.listener.maybe_reset(is_idle=True)
-                        continue
+                if not self.user_speaking:
+                    if speech:
+                        if agent_speaking and is_likely_agent_echo(
+                            delta_text, recent_agent_text, lang_code=self.language
+                        ):
+                            self._pre_speech_blocks.append(block)
+                            self.listener.maybe_reset(is_idle=True)
+                            continue
 
-                    turn_id = f"usr-{uuid.uuid4().hex[:8]}"
-                    self.user_speaking = True
-                    self.active_user_turn_id = turn_id
-                    self.active_user_transcript = delta_text.strip()
-                    self.empty_chunk_streak = 0
-                    self.user_blocks_in_turn = 1
-                    self._last_speech_block_ts = time.perf_counter()
+                        turn_id = f"usr-{uuid.uuid4().hex[:8]}"
+                        self.user_speaking = True
+                        self.active_user_turn_id = turn_id
+                        self.active_user_transcript = delta_text.strip()
+                        self.empty_chunk_streak = 0
+                        self.user_blocks_in_turn = 1
+                        self._last_speech_block_ts = time.perf_counter()
 
-                    onset_blocks = list(self._pre_speech_blocks)[-1:] + [block]
-                    self._pre_speech_blocks.clear()
-                    self.active_user_pcm_blocks = list(onset_blocks)
+                        onset_blocks = list(self._pre_speech_blocks)[-1:] + [block]
+                        self._pre_speech_blocks.clear()
+                        self.active_user_pcm_blocks = list(onset_blocks)
 
-                    if agent_speaking:
+                        if agent_speaking:
+                            events.append(
+                                {
+                                    "type": "barge_in_detected",
+                                    "heard_text": self.active_user_transcript,
+                                }
+                            )
                         events.append(
                             {
-                                "type": "barge_in_detected",
-                                "heard_text": self.active_user_transcript,
+                                "type": "user_speech_start",
+                                "turn_id": turn_id,
+                                "text": self.active_user_transcript,
                             }
                         )
-                    events.append(
-                        {
-                            "type": "user_speech_start",
-                            "turn_id": turn_id,
-                            "text": self.active_user_transcript,
-                        }
-                    )
-                else:
-                    self._pre_speech_blocks.append(block)
-                    self.listener.maybe_reset(is_idle=True)
-            else:
-                self.user_blocks_in_turn += 1
-                if speech:
-                    self.empty_chunk_streak = 0
-                    self._last_speech_block_ts = time.perf_counter()
-                    self.active_user_transcript = append_transcript_piece(
-                        self.active_user_transcript, delta_text
-                    )
-                    self.active_user_pcm_blocks.append(block)
-                    events.append(
-                        {
-                            "type": "user_speech_delta",
-                            "turn_id": self.active_user_turn_id,
-                            "text": self.active_user_transcript,
-                        }
-                    )
-                else:
-                    self.empty_chunk_streak += 1
-                    if self.empty_chunk_streak == 1:
-                        self.active_user_pcm_blocks.append(block)
-                    needed = required_empty_chunks(
-                        self.active_user_transcript,
-                        patience,
-                        lang_code=self.language,
-                    )
-                    if (
-                        self.empty_chunk_streak >= needed
-                        or self.user_blocks_in_turn >= self.max_user_blocks
-                    ):
-                        self._commit_current_user_turn(events)
+                    else:
+                        self._pre_speech_blocks.append(block)
                         self.listener.maybe_reset(is_idle=True)
-                self.listener.maybe_reset(is_idle=False)
+                else:
+                    self.user_blocks_in_turn += 1
+                    if speech:
+                        self.empty_chunk_streak = 0
+                        self._last_speech_block_ts = time.perf_counter()
+                        self.active_user_transcript = append_transcript_piece(
+                            self.active_user_transcript, delta_text
+                        )
+                        self.active_user_pcm_blocks.append(block)
+                        events.append(
+                            {
+                                "type": "user_speech_delta",
+                                "turn_id": self.active_user_turn_id,
+                                "text": self.active_user_transcript,
+                            }
+                        )
+                    else:
+                        self.empty_chunk_streak += 1
+                        if self.empty_chunk_streak == 1:
+                            self.active_user_pcm_blocks.append(block)
+                        needed = required_empty_chunks(
+                            self.active_user_transcript,
+                            patience,
+                            lang_code=self.language,
+                        )
+                        if (
+                            self.empty_chunk_streak >= needed
+                            or self.user_blocks_in_turn >= self.max_user_blocks
+                        ):
+                            self._commit_current_user_turn(events)
+                            self.listener.maybe_reset(is_idle=True)
+                    self.listener.maybe_reset(is_idle=False)
 
-        return events
+            return events
 
     def flush_ptt_audio(self, pcm16_bytes: bytes) -> list[dict[str, Any]]:
         if not pcm16_bytes:
             return []
-        self.listener.reset_window()
-        profile = get_language_profile(self.language)
-        wav_f32 = _pcm16_to_float32(pcm16_bytes)
-        prompt = self._runner.build_prompt(
-            [
-                {
-                    "role": "system",
-                    "content": f"Perform ASR in {profile.router_language_name}.",
-                },
-                {"role": "user", "content": [{"type": "audio"}]},
-            ],
-            audio_clips_16k=[wav_f32],
-            add_generation_prompt=True,
-        )
-        transcript = self._runner.complete_text(
-            prompt,
-            max_tokens=256,
-            temperature=0.0,
-            extra_args={"generation_mode": "text"},
-        )
-        self.listener.reset_window()
-        transcript = transcript.strip() or "(spoken message)"
-        turn_id = f"usr-{uuid.uuid4().hex[:8]}"
-        self.history.append(
-            TurnRecord(role="user", text=transcript, user_pcm16=pcm16_bytes)
-        )
-        return [
-            {"type": "user_speech_start", "turn_id": turn_id, "text": transcript},
-            {"type": "user_turn_committed", "turn_id": turn_id, "text": transcript},
-        ]
+        with self._listen_lock:
+            self.listener.reset_window()
+            profile = get_language_profile(self.language)
+            wav_f32 = _pcm16_to_float32(pcm16_bytes)
+            prompt = self._runner.build_prompt(
+                [
+                    {
+                        "role": "system",
+                        "content": f"Perform ASR in {profile.router_language_name}.",
+                    },
+                    {"role": "user", "content": [{"type": "audio"}]},
+                ],
+                audio_clips_16k=[wav_f32],
+                add_generation_prompt=True,
+            )
+            transcript = self._runner.complete_text(
+                prompt,
+                max_tokens=256,
+                temperature=0.0,
+                extra_args={"generation_mode": "text"},
+            )
+            self.listener.reset_window()
+            transcript = transcript.strip() or "(spoken message)"
+            turn_id = f"usr-{uuid.uuid4().hex[:8]}"
+            self.history.append(
+                TurnRecord(role="user", text=transcript, user_pcm16=pcm16_bytes)
+            )
+            return [
+                {"type": "user_speech_start", "turn_id": turn_id, "text": transcript},
+                {"type": "user_turn_committed", "turn_id": turn_id, "text": transcript},
+            ]
 
     def rollback_interrupted_assistant_turn(
         self,
@@ -1042,6 +1051,7 @@ class VllmStreamingConversationSession:
         cancel_event: threading.Event,
         emit: Callable[[dict[str, Any]], None],
         t_start: float,
+        poll_barge_in: Optional[Callable[[], None]] = None,
     ) -> tuple[int, float, int, int]:
         profile = get_language_profile(self.language)
         system_msg = f"Perform TTS in {profile.tts_accent} using a {persona.voice_gender} voice."
@@ -1087,6 +1097,7 @@ class VllmStreamingConversationSession:
             cancel_event=cancel_event,
             on_text_delta=lambda _piece: None,
             on_audio_pcm=on_audio_pcm,
+            poll_barge_in=poll_barge_in,
         )
 
         audio_frames = max(0, total_pcm_bytes // (2 * 1920))
@@ -1266,13 +1277,38 @@ class VllmStreamingConversationSession:
         if final_text and chunks_sent == 0 and not cancel_event.is_set():
             used_tts_fallback = True
             fb_frames, fb_ttfa, fb_chunks, fb_first = self._stream_tts_fallback(
-                final_text, persona, cancel_event, on_event, t_start
+                final_text,
+                persona,
+                cancel_event,
+                on_event,
+                t_start,
+                poll_barge_in=check_barge_in if poll_mic_fn is not None else None,
             )
             chunks_sent += fb_chunks
             total_audio_bytes += fb_frames * 2 * 1920
             if ttfa_ms == 0.0:
                 ttfa_ms = fb_ttfa
                 first_chunk_samples = fb_first
+            if cancel_event.is_set():
+                partial_frames = max(0, total_audio_bytes // (2 * 1920))
+                partial_rec = TurnRecord(
+                    role="assistant",
+                    text=final_text,
+                    raw_audio_codes=[None] * partial_frames if partial_frames else None,
+                )
+                return TurnOutcome(
+                    kind="cancelled",
+                    turn_record=partial_rec,
+                    text=final_text,
+                    audio_frames=partial_frames,
+                    ttfa_ms=ttfa_ms,
+                    ttft_ms=ttft_ms,
+                    audio_chunks_sent=chunks_sent,
+                    first_chunk_samples=first_chunk_samples,
+                    gen_wall_ms=(time.perf_counter() - t_start) * 1000.0,
+                    cancelled=True,
+                    used_tts_fallback=True,
+                )
 
         audio_frames = max(0, total_audio_bytes // (2 * 1920))
         wall_ms = (time.perf_counter() - t_start) * 1000.0
@@ -1471,6 +1507,11 @@ class VllmStreamingConversationSession:
                 else:
                     buffered_events.append(ev)
 
+        def guarded_direct_poll() -> list[dict[str, Any]]:
+            if poll_mic_fn is None or spec_cancel.is_set() or cancel_event.is_set():
+                return []
+            return poll_mic_fn()
+
         with ThreadPoolExecutor(max_workers=2) as pool:
             r_fut = pool.submit(self._run_router_call, user_text)
             d_fut = pool.submit(
@@ -1480,7 +1521,7 @@ class VllmStreamingConversationSession:
                 force_interleaved=not bool(tools),
                 cancel_event=_LinkedEvent(),  # type: ignore[arg-type]
                 on_event=direct_on_event,
-                poll_mic_fn=poll_mic_fn,
+                poll_mic_fn=guarded_direct_poll if poll_mic_fn is not None else None,
                 segment="answer",
             )
             dec, query, route_ms = r_fut.result()
@@ -1491,7 +1532,7 @@ class VllmStreamingConversationSession:
                 return BatchPlanOutcome(
                     decision="cancelled",
                     filler_turn=d_out.turn_record,
-                    filler_audio_frames=d_out.audio_frames,
+                    filler_audio_frames=0,
                     route_decision_ms=route_ms,
                 )
 
@@ -1507,7 +1548,7 @@ class VllmStreamingConversationSession:
                     return BatchPlanOutcome(
                         decision="cancelled",
                         filler_turn=d_out.turn_record,
-                        filler_audio_frames=d_out.audio_frames,
+                        filler_audio_frames=0,
                         route_decision_ms=route_ms,
                     )
                 if d_out.kind == "tool_calls":
@@ -1671,6 +1712,15 @@ class VllmOmniEngine:
             runner.complete_text(
                 warmup_prompt,
                 max_tokens=2,
+                temperature=0.0,
+                extra_args={"generation_mode": "text"},
+            )
+            asr_warmup_prompt = runner.build_live_asr_prompt(
+                np.zeros((10240,), dtype=np.float32)
+            )
+            runner.complete_text(
+                asr_warmup_prompt,
+                max_tokens=4,
                 temperature=0.0,
                 extra_args={"generation_mode": "text"},
             )

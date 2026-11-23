@@ -1107,6 +1107,7 @@ class BatchLfm3Generator:
                 persona=persona,
                 cancel_event=cancel_event,
                 on_event=on_tts_event,
+                poll_mic_fn=poll_mic_fn,
             )
             if cancel_event.is_set():
                 return BatchPlanOutcome(decision="cancelled")

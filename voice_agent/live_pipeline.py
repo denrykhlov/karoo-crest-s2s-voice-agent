@@ -1177,6 +1177,7 @@ class StreamingConversationSession:
                 cancel_event=cancel_event,
                 on_event=on_tts_event,
                 segment_name=segment_name,
+                poll_mic_fn=poll_mic_fn,
             )
             if cancel_event.is_set():
                 p_turn = build_partial_turn()
@@ -1288,6 +1289,7 @@ class StreamingConversationSession:
         cancel_event: threading.Event,
         on_event: Callable[[dict[str, Any]], None],
         segment_name: str = "answer",
+        poll_mic_fn: Optional[Callable[[], list[dict[str, Any]]]] = None,
     ) -> tuple[Optional[np.ndarray], list[int]]:
         """Fallback TTS synthesis via LFM3-Omni when `generation_mode=None` emitted plain text."""
         tts_accent = get_language_profile(self.language).tts_accent
@@ -1314,17 +1316,31 @@ class StreamingConversationSession:
         all_codes: list[np.ndarray] = []
         out_token_ids: list[int] = []
 
-        for token, codes in self.model.stream_slots(
-            input_ids,
-            max_tokens=self.settings.max_slots,
-            generation_mode="audio",
-            audio_temperature=self.settings.audio_temperature,
-            audio_top_k=self.settings.audio_top_k,
-            audio_repetition_penalty=self.settings.audio_repetition_penalty,
-            audio_repetition_window=self.settings.audio_repetition_window,
+        for step_idx, (token, codes) in enumerate(
+            self.model.stream_slots(
+                input_ids,
+                max_tokens=self.settings.max_slots,
+                generation_mode="audio",
+                audio_temperature=self.settings.audio_temperature,
+                audio_top_k=self.settings.audio_top_k,
+                audio_repetition_penalty=self.settings.audio_repetition_penalty,
+                audio_repetition_window=self.settings.audio_repetition_window,
+            )
         ):
             if cancel_event.is_set():
-                return None, []
+                return (
+                    np.stack(all_codes, axis=0).astype(np.int32) if all_codes else None
+                ), out_token_ids
+            if (
+                poll_mic_fn is not None
+                and step_idx > 0
+                and step_idx % self.settings.coop_listen_slot_interval == 0
+            ):
+                if any(ev.get("type") == "barge_in_detected" for ev in poll_mic_fn()):
+                    cancel_event.set()
+                    return (
+                        np.stack(all_codes, axis=0).astype(np.int32) if all_codes else None
+                    ), out_token_ids
             if codes is not None:
                 c_np = np.asarray(codes, dtype=np.int32)
                 all_codes.append(c_np)
