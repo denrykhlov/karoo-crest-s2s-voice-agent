@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -89,6 +90,26 @@ def _audio_output_to_pcm16(audio_obj: Any) -> bytes:
     if combined.size == 0:
         return b""
     return _float32_to_pcm16(combined)
+
+
+def _extract_mm_audio_pcm16(output: Any) -> bytes:
+    """Extract 24 kHz PCM16 bytes from Stage 1 `OmniRequestOutput` (supports `Mapping` payloads)."""
+    mm = getattr(output, "multimodal_output", None)
+    if not mm:
+        for completion_output in getattr(output, "outputs", None) or ():
+            completion_mm = getattr(completion_output, "multimodal_output", None)
+            if completion_mm:
+                mm = completion_mm
+                break
+    if not isinstance(mm, Mapping):
+        return b""
+    if "audio" in mm:
+        audio_obj = mm["audio"]
+    elif "model_outputs" in mm:
+        audio_obj = mm["model_outputs"]
+    else:
+        return b""
+    return _audio_output_to_pcm16(audio_obj)
 
 
 def _normalize_tool_calls_for_template(
@@ -385,16 +406,10 @@ class _NativeOmniRunner:
                         piece = getattr(out0, "text", "") if out0 is not None else ""
                         if piece:
                             item_q.put(("text", str(piece)))
-                    elif out_type == "audio":
-                        mm = (
-                            (getattr(out0, "multimodal_output", None) if out0 is not None else None)
-                            or getattr(output, "multimodal_output", None)
-                            or {}
-                        )
-                        if isinstance(mm, dict):
-                            pcm = _audio_output_to_pcm16(mm.get("audio"))
-                            if pcm:
-                                item_q.put(("audio", pcm))
+                    elif out_type == "audio" or getattr(output, "stage_id", None) == 1:
+                        pcm = _extract_mm_audio_pcm16(output)
+                        if pcm:
+                            item_q.put(("audio", pcm))
                 finished_normally = not cancel_event.is_set()
             except Exception as exc:
                 if not cancel_event.is_set():
@@ -1045,7 +1060,6 @@ class VllmStreamingConversationSession:
                 "audio_temperature": float(self.settings.audio_temperature),
                 "audio_top_k": int(self.settings.audio_top_k),
                 "audio_repetition_penalty": float(self.settings.audio_repetition_penalty),
-                "audio_repetition_window": int(self.settings.audio_repetition_window),
             },
             streaming=True,
         )
@@ -1106,7 +1120,6 @@ class VllmStreamingConversationSession:
                 "audio_temperature": float(self.settings.audio_temperature),
                 "audio_top_k": int(self.settings.audio_top_k),
                 "audio_repetition_penalty": float(self.settings.audio_repetition_penalty),
-                "audio_repetition_window": int(self.settings.audio_repetition_window),
             },
             streaming=True,
         )

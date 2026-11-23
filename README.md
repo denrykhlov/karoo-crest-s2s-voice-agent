@@ -89,7 +89,7 @@ python3 telesales_agent.py --backend vllm \
 ```
 
 ### Runpod GPU Pod (GHCR Container)
-1. Push to `main` to build `linux/amd64` via GitHub Actions and publish `ghcr.io/denrykhlov/karoo-crest-s2s-voice-agent:v0.1.3` (pinned to CUDA 13 + `vllm/vllm-openai:v0.33.0` + `vllm-omni@ca9398dc`, running single-process `AsyncOmni` directly in-process).
+1. Push to `main` to build `linux/amd64` via GitHub Actions and publish `ghcr.io/denrykhlov/karoo-crest-s2s-voice-agent:v0.1.4` (pinned to CUDA 13 + `vllm/vllm-openai:v0.33.0` + `vllm-omni@ca9398dc`, running single-process `AsyncOmni` directly in-process).
 2. Deploy a Runpod Pod on **CUDA >= 13.0** (e.g., `NVIDIA A40` 48 GB or `NVIDIA L4` / `RTX 4090` 24 GB) exposing `8000/http` with a persistent `/workspace` volume for HuggingFace model weights (`/workspace/.cache/huggingface`) and call artifacts (`/workspace/calls`).
 3. Optional environment variables on the Pod:
    - `MODEL_ID` (default `LiquidAI/LFM3-Omni-2B`)

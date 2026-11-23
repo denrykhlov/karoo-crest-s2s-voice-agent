@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import wave
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -59,10 +60,29 @@ class _FakeTensor:
         return self._arr
 
 
+class _FakeMultimodalPayload(Mapping):
+    """Non-dict Mapping mirroring `vllm_omni.outputs.mm_outputs.MultimodalPayload`."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self._data = dict(data)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+assert not isinstance(_FakeMultimodalPayload({}), dict)
+
+
 @dataclass
 class FakeCompletionOutput:
     text: str = ""
-    multimodal_output: dict[str, Any] = field(default_factory=dict)
+    multimodal_output: Any = field(default_factory=dict)
 
 
 @dataclass
@@ -73,7 +93,7 @@ class FakeOmniRequestOutput:
     outputs: list[FakeCompletionOutput]
     finished: bool = False
     error: str | None = None
-    multimodal_output: dict[str, Any] = field(default_factory=dict)
+    multimodal_output: Any = field(default_factory=dict)
 
 
 class FakeTokenizer:
@@ -287,12 +307,12 @@ class FakeAsyncOmni:
         if "<|im_start|>system\nPerform TTS in " in rendered:
             assert rendered.endswith("<|audio_start|>")
             assert output_modalities == ["audio"]
-            # Emit a metadata-only empty chunk first to verify resilience
+            # Emit metadata-only empty chunks first, then `model_outputs` via non-dict Mapping
             yield FakeOmniRequestOutput(
                 request_id=request_id,
                 stage_id=1,
                 final_output_type="audio",
-                outputs=[FakeCompletionOutput(text="", multimodal_output={"audio": None})],
+                outputs=[FakeCompletionOutput(text="", multimodal_output=_FakeMultimodalPayload({"model_outputs": None}))],
                 finished=False,
             )
             yield FakeOmniRequestOutput(
@@ -302,7 +322,21 @@ class FakeAsyncOmni:
                 outputs=[
                     FakeCompletionOutput(
                         text="",
-                        multimodal_output={"audio": [_FakeTensor(_pcm16_24k_sine(frames=2))]},
+                        multimodal_output=_FakeMultimodalPayload({"model_outputs": np.zeros((0,), dtype=np.float32)}),
+                    )
+                ],
+                finished=False,
+            )
+            yield FakeOmniRequestOutput(
+                request_id=request_id,
+                stage_id=1,
+                final_output_type="audio",
+                outputs=[
+                    FakeCompletionOutput(
+                        text="",
+                        multimodal_output=_FakeMultimodalPayload(
+                            {"model_outputs": [_FakeTensor(_pcm16_24k_sine(frames=2))]}
+                        ),
                     )
                 ],
                 finished=True,
@@ -371,7 +405,9 @@ class FakeAsyncOmni:
                         outputs=[
                             FakeCompletionOutput(
                                 text="",
-                                multimodal_output={"audio": np.zeros((0,), dtype=np.float32)},
+                                multimodal_output=_FakeMultimodalPayload(
+                                    {"audio": np.zeros((0,), dtype=np.float32)}
+                                ),
                             )
                         ],
                         finished=False,
@@ -385,7 +421,7 @@ class FakeAsyncOmni:
                         outputs=[
                             FakeCompletionOutput(
                                 text="",
-                                multimodal_output={"audio": _FakeTensor(wav)},
+                                multimodal_output=_FakeMultimodalPayload({"audio": _FakeTensor(wav)}),
                             )
                         ],
                         finished=(step_idx == n_steps - 1),
