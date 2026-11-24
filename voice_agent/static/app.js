@@ -9,6 +9,9 @@
     muted: false,
     inputMode: "live", // "live" | "ptt"
     acceptingAudio: false,
+    activeAssistantTurnId: null,
+    audioRevealedTurns: new Set(),
+    pendingAssistantText: new Map(),
     audioCtx: null,
     micStream: null,
     captureNode: null,
@@ -303,6 +306,16 @@
     }
   }
 
+  function revealAssistantText(turnId) {
+    if (!turnId) return;
+    state.audioRevealedTurns.add(turnId);
+    if (state.pendingAssistantText.has(turnId)) {
+      const buffered = state.pendingAssistantText.get(turnId);
+      state.pendingAssistantText.delete(turnId);
+      updateTranscriptMessage(turnId, buffered, false);
+    }
+  }
+
   function handleIncomingAudio(arrayBuffer) {
     stopRingtone();
     if (!state.acceptingAudio) {
@@ -313,6 +326,8 @@
         { type: "audio", buffer: arrayBuffer },
         [arrayBuffer]
       );
+    } else if (state.activeAssistantTurnId) {
+      revealAssistantText(state.activeAssistantTurnId);
     }
   }
 
@@ -357,6 +372,12 @@
       case "barge_in":
         stopRingtone();
         state.acceptingAudio = false;
+        if (
+          state.activeAssistantTurnId &&
+          !state.audioRevealedTurns.has(state.activeAssistantTurnId)
+        ) {
+          state.pendingAssistantText.delete(state.activeAssistantTurnId);
+        }
         state.agentRms = 0;
         if (state.playbackNode) {
           state.playbackNode.port.postMessage({ type: "clear" });
@@ -375,6 +396,9 @@
       case "assistant_turn_start":
         ensureFeedStarted();
         state.acceptingAudio = true;
+        state.activeAssistantTurnId = msg.turn_id;
+        state.audioRevealedTurns.delete(msg.turn_id);
+        state.pendingAssistantText.delete(msg.turn_id);
         if (state.playbackNode) {
           state.playbackNode.port.postMessage({ type: "new_turn", turnId: msg.turn_id });
         }
@@ -388,11 +412,16 @@
         break;
 
       case "text_delta":
-        updateTranscriptMessage(msg.turn_id, msg.text, false);
+        if (state.audioRevealedTurns.has(msg.turn_id)) {
+          updateTranscriptMessage(msg.turn_id, msg.text, false);
+        } else {
+          state.pendingAssistantText.set(msg.turn_id, msg.text || "");
+        }
         break;
 
       case "assistant_turn_end":
       case "assistant_turn_truncated":
+        revealAssistantText(msg.turn_id);
         updateTranscriptMessage(msg.turn_id, msg.text, false);
         if (msg.metrics) {
           updateTranscriptMetrics(msg.turn_id, msg.metrics);
@@ -627,6 +656,7 @@
         const d = event.data;
         if (!d) return;
         if (d.type === "started") {
+          revealAssistantText(d.turnId || state.activeAssistantTurnId);
           sendJson({
             type: "playback_started",
             turn_id: d.turnId,
@@ -693,6 +723,9 @@
     }
     state.turns.clear();
     state.pendingMetrics.clear();
+    state.activeAssistantTurnId = null;
+    state.audioRevealedTurns.clear();
+    state.pendingAssistantText.clear();
     state.transcriptLog = [];
     state.delegationLog = [];
     els.transcriptFeed.innerHTML = "";
@@ -732,6 +765,9 @@
   function stopCallMedia() {
     state.callActive = false;
     state.acceptingAudio = false;
+    state.activeAssistantTurnId = null;
+    state.audioRevealedTurns.clear();
+    state.pendingAssistantText.clear();
     stopRingtone();
     clearInterval(state.timerInterval);
     state.agentRms = 0;

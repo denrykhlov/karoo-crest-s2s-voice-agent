@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -143,13 +144,15 @@ def _normalize_tool_calls_for_template(
 
 
 def _parse_router_query(raw_router_text: str, fallback_text: str) -> tuple[str, str]:
-    """Parse `DIRECT` or `DELEGATE: <question>` into `(kind, standalone_question)`."""
+    """Parse `DIRECT`, `TOOL`, or `DELEGATE: <question>` into `(kind, standalone_question)`."""
     cleaned = clean_display_text(raw_router_text).strip()
     upper = cleaned.upper()
     if "DELEGATE" in upper:
         idx = upper.find("DELEGATE")
         tail = cleaned[idx + len("DELEGATE") :].lstrip(" :-\n\t")
         return "delegate", (tail.strip() or fallback_text.strip() or "(banking question)")
+    if upper.startswith("TOOL") or re.search(r"\bTOOL\b", upper):
+        return "tool", ""
     return "direct", ""
 
 
@@ -981,6 +984,7 @@ class VllmStreamingConversationSession:
         *,
         include_tools: bool = True,
         extra_system_note: str = "",
+        trailing_user_instruction: str = "",
         force_mixed_prefix: bool = False,
     ) -> dict[str, Any]:
         sys_parts = [self.system_prompt]
@@ -1033,6 +1037,9 @@ class VllmStreamingConversationSession:
                     messages.append({"role": "assistant", "content": turn.text})
             elif turn.role == "tool":
                 messages.append({"role": "tool", "content": turn.text})
+
+        if trailing_user_instruction:
+            messages.append({"role": "user", "content": trailing_user_instruction})
 
         use_mixed_prefix = bool(force_mixed_prefix and not tool_schemas)
         return self._runner.build_prompt(
@@ -1115,12 +1122,14 @@ class VllmStreamingConversationSession:
         segment: str = "answer",
         max_tokens: Optional[int] = None,
         extra_system_note: str = "",
+        trailing_user_instruction: str = "",
     ) -> TurnOutcome:
         t_start = time.perf_counter()
         use_tools = bool(tools) and not force_interleaved
         prompt = self._build_prompt(
             include_tools=use_tools,
             extra_system_note=extra_system_note,
+            trailing_user_instruction=trailing_user_instruction,
             force_mixed_prefix=not use_tools,
         )
         sampling_params_list = self._runner.build_sampling_params_list(
@@ -1357,22 +1366,43 @@ class VllmStreamingConversationSession:
             self.history.append(outcome.turn_record)
         return outcome
 
-    def _run_router_call(self, user_text: str) -> tuple[str, str, float]:
+    def _run_router_call(self, user_text: str, *, has_tools: bool = True) -> tuple[str, str, float]:
         t0 = time.perf_counter()
         profile = get_language_profile(self.language)
         prev_asst = self.latest_assistant_text()
         ctx_line = f"Previous advisor turn: {prev_asst}\n" if prev_asst else ""
+        tool_rule = (
+            "- Output `TOOL` ONLY when the customer explicitly gives concrete income, loan amount, term, "
+            "or application/callback details requiring CRM pre-qualification, repayment calculation, application submission, or callback scheduling.\n"
+            "- Output `DIRECT` for greetings, yes/no, short clarifications, objections, complaints/meta-questions "
+            "(\"Why are you so slow?\", \"Why are you repeating?\"), or general conversation.\n"
+            if has_tools
+            else "- Output `DIRECT` for greetings, yes/no, short clarifications, objections, complaints/meta-questions, and general conversation.\n"
+        )
+        examples = (
+            "Examples:\n"
+            "- \"No, I can't tell you.\" -> DIRECT\n"
+            "- \"Why are you repeating yourself?\" -> DIRECT\n"
+            + ("- \"I earn R35,000 full-time with SA ID.\" -> TOOL\n" if has_tools else "")
+            + f"- \"What are the Protea Platinum lounge fees?\" -> DELEGATE: What are the Ubuntu Protea Platinum airport lounge fees?"
+        )
         prompt_text = (
             f"{ctx_line}"
             f"Customer just said: {user_text or '(audio turn)'}\n\n"
             "Classify into exactly ONE line:\n"
-            "- Output `DIRECT` for greetings, short rapport, clarifications, or local CRM calculations/applications.\n"
+            f"{tool_rule}"
             f"- Output `DELEGATE: <concise standalone question in {profile.router_language_name}>` "
-            "ONLY for detailed product policy, tariffs, FX fees, grace days, NCA/FICA/POPIA rules, or travel perks."
+            "ONLY when the customer asks a specific product policy, tariff, fee, FX, grace period, or NCA/FICA/POPIA question.\n\n"
+            f"{examples}"
+        )
+        sys_prompt = (
+            "Output strictly `DIRECT`, `TOOL`, or `DELEGATE: <question>`."
+            if has_tools
+            else "Output strictly `DIRECT` or `DELEGATE: <question>`."
         )
         prompt = self._runner.build_prompt(
             [
-                {"role": "system", "content": "Output strictly `DIRECT` or `DELEGATE: <question>`."},
+                {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt_text},
             ],
             add_generation_prompt=True,
@@ -1384,6 +1414,8 @@ class VllmStreamingConversationSession:
             extra_args={"generation_mode": "text"},
         )
         dec, query = _parse_router_query(raw, user_text)
+        if dec == "tool" and not has_tools:
+            dec = "direct"
         return dec, query, (time.perf_counter() - t0) * 1000.0
 
     def _run_query_extract_call(self, user_text: str) -> str:
@@ -1439,8 +1471,8 @@ class VllmStreamingConversationSession:
                 on_event=on_event,
                 poll_mic_fn=poll_mic_fn,
                 segment="filler",
-                max_tokens=self.settings.max_filler_slots,
-                extra_system_note=profile.filler_instruction,
+                max_tokens=min(int(self.settings.max_filler_slots), 120),
+                trailing_user_instruction=profile.filler_instruction,
             )
             query = q_fut.result()
             if not cancel_event.is_set() and query:
@@ -1513,12 +1545,14 @@ class VllmStreamingConversationSession:
             return poll_mic_fn()
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            r_fut = pool.submit(self._run_router_call, user_text)
+            r_fut = pool.submit(self._run_router_call, user_text, has_tools=bool(tools))
+            # Always speculate in native interleaved S2S (`tools=None`) so DIRECT replies
+            # stream voice natively at ~500 ms TTFA instead of 2-pass TTS fallback.
             d_fut = pool.submit(
                 self._stream_omni_chat,
                 persona=persona,
-                tools=tools,
-                force_interleaved=not bool(tools),
+                tools=None,
+                force_interleaved=True,
                 cancel_event=_LinkedEvent(),  # type: ignore[arg-type]
                 on_event=direct_on_event,
                 poll_mic_fn=guarded_direct_poll if poll_mic_fn is not None else None,
@@ -1551,12 +1585,6 @@ class VllmStreamingConversationSession:
                         filler_audio_frames=0,
                         route_decision_ms=route_ms,
                     )
-                if d_out.kind == "tool_calls":
-                    return BatchPlanOutcome(
-                        decision="tool_calls",
-                        direct_outcome=d_out,
-                        route_decision_ms=route_ms,
-                    )
                 self.history.append(
                     d_out.turn_record or TurnRecord(role="assistant", text=d_out.text)
                 )
@@ -1569,6 +1597,45 @@ class VllmStreamingConversationSession:
                     audio_chunks_sent=d_out.audio_chunks_sent,
                     first_chunk_samples=d_out.first_chunk_samples,
                     slots_per_sec=d_out.slots_per_sec,
+                )
+
+            if dec == "tool" and tools:
+                spec_cancel.set()
+                d_fut.result()
+                tool_out = self._stream_omni_chat(
+                    persona=persona,
+                    tools=tools,
+                    force_interleaved=False,
+                    cancel_event=cancel_event,
+                    on_event=on_event,
+                    poll_mic_fn=poll_mic_fn,
+                    segment="answer",
+                )
+                if tool_out.cancelled or cancel_event.is_set():
+                    return BatchPlanOutcome(
+                        decision="cancelled",
+                        filler_turn=tool_out.turn_record,
+                        filler_audio_frames=0,
+                        route_decision_ms=route_ms,
+                    )
+                if tool_out.kind == "tool_calls":
+                    return BatchPlanOutcome(
+                        decision="tool_calls",
+                        direct_outcome=tool_out,
+                        route_decision_ms=route_ms,
+                    )
+                self.history.append(
+                    tool_out.turn_record or TurnRecord(role="assistant", text=tool_out.text)
+                )
+                return BatchPlanOutcome(
+                    decision="direct",
+                    direct_outcome=tool_out,
+                    route_decision_ms=route_ms,
+                    ttft_ms=tool_out.ttft_ms,
+                    ttfa_direct_ms=tool_out.ttfa_ms,
+                    audio_chunks_sent=tool_out.audio_chunks_sent,
+                    first_chunk_samples=tool_out.first_chunk_samples,
+                    slots_per_sec=tool_out.slots_per_sec,
                 )
 
             # Router chose DELEGATE -> abort speculative direct generation & dispatch query now.
@@ -1586,8 +1653,8 @@ class VllmStreamingConversationSession:
                     on_event=on_event,
                     poll_mic_fn=poll_mic_fn,
                     segment="filler",
-                    max_tokens=self.settings.max_filler_slots,
-                    extra_system_note=profile.filler_instruction,
+                    max_tokens=min(int(self.settings.max_filler_slots), 120),
+                    trailing_user_instruction=profile.filler_instruction,
                 )
             d_fut.result()
 

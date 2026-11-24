@@ -380,7 +380,8 @@ class FakeAsyncOmni:
             and ("holding phrase" in lower or "filler" in lower)
         )
         with self.lock:
-            pending_tool = None if is_filler else self.tool_call_on_next_answer
+            has_tools_in_prompt = "<|tool_list_start|>" in rendered
+            pending_tool = None if (is_filler or not has_tools_in_prompt) else self.tool_call_on_next_answer
             if pending_tool is not None and not self.stream_delay_s:
                 self.tool_call_on_next_answer = None
             omit_audio = self.omit_chat_audio
@@ -1365,5 +1366,84 @@ def test_vllm_barge_in_during_delegation_wait_cancels_delegation(
 
             detail = client.get(f"/api/calls/{call_id}").json()
             assert detail["metadata"]["counts"]["error_count"] == 0
+    finally:
+        engine.shutdown()
+
+
+def test_vllm_speculative_native_s2s_direct_tool_route_and_trailing_filler_prompt() -> None:
+    """DIRECT uses native `<|mixed_start|>`, TOOL runs CRM tool schemas, DELEGATE puts filler last."""
+    omni = FakeAsyncOmni()
+    tok = FakeTokenizer()
+    settings = EngineSettings(backend="vllm", model_id="LiquidAI/LFM3-Omni-2B")
+    engine = VllmOmniEngine(settings, omni_client=omni, tokenizer=tok)
+    engine.load()
+    persona = next(p for p in build_personas() if p.id == "naledi")
+    tools = build_tools()
+    try:
+        sess = engine.create_pipeline()
+        sess.initialize_conversation(persona.system_prompt, tools=tools, language="en")
+
+        # 1. DIRECT route even with `tools` provided uses native `<|mixed_start|>` without TTS fallback
+        omni.router_decision = "DIRECT"
+        sess.append_text_user_turn("Why did you repeat yourself?")
+        omni.calls.clear()
+        dir_plan = sess.run_speculative_selective_batch(
+            persona=persona,
+            tools=tools,
+            dynamic_filler_enabled=True,
+            cancel_event=threading.Event(),
+            on_event=lambda _e: None,
+        )
+        assert dir_plan.decision == "direct"
+        assert dir_plan.direct_outcome is not None
+        assert dir_plan.direct_outcome.used_tts_fallback is False
+        assert dir_plan.direct_outcome.audio_frames == 4
+        chat_calls = [c for c in omni.calls if c["output_modalities"] == ["text", "audio"]]
+        assert chat_calls
+        assert chat_calls[-1]["rendered"].endswith("<|mixed_start|>")
+        assert "<|tool_list_start|>" not in chat_calls[-1]["rendered"]
+
+        # 2. TOOL route aborts speculative native stream and runs tool-enabled completion
+        omni.router_decision = "TOOL"
+        omni.tool_call_on_next_answer = (
+            "check_pre_qualification",
+            {"monthly_income_zar": 35000},
+        )
+        sess.append_text_user_turn("I earn R35,000 full-time with SA ID.")
+        omni.calls.clear()
+        tool_plan = sess.run_speculative_selective_batch(
+            persona=persona,
+            tools=tools,
+            dynamic_filler_enabled=True,
+            cancel_event=threading.Event(),
+            on_event=lambda _e: None,
+        )
+        assert tool_plan.decision == "tool_calls"
+        assert tool_plan.direct_outcome is not None
+        assert tool_plan.direct_outcome.tool_calls[0]["function"]["name"] == "check_pre_qualification"
+        tool_chat_calls = [c for c in omni.calls if "<|tool_list_start|>" in c["rendered"]]
+        assert len(tool_chat_calls) == 1
+
+        # 3. DELEGATE route places filler instruction in trailing user turn (never buried in system prompt)
+        omni.router_decision = "DELEGATE: What are the Ubuntu Protea Platinum airport lounge fees?"
+        sess.append_text_user_turn("What are the Protea Platinum airport lounge fees?")
+        omni.calls.clear()
+        del_plan = sess.run_speculative_selective_batch(
+            persona=persona,
+            tools=tools,
+            dynamic_filler_enabled=True,
+            cancel_event=threading.Event(),
+            on_event=lambda _e: None,
+        )
+        assert del_plan.decision == "delegate"
+        filler_calls = [
+            c for c in omni.calls if "holding phrase" in c["rendered"].lower()
+        ]
+        assert len(filler_calls) == 1
+        rendered_filler = filler_calls[0]["rendered"]
+        sys_section = rendered_filler.split("<|im_end|>\n", 1)[0]
+        trailing_section = rendered_filler.rsplit("<|im_start|>user\n", 1)[-1]
+        assert "holding phrase" not in sys_section.lower()
+        assert "holding phrase" in trailing_section.lower()
     finally:
         engine.shutdown()
