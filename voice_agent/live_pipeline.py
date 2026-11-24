@@ -388,6 +388,11 @@ class StreamingConversationSession:
                 "text": transcript,
                 "endpoint_ms": endpoint_ms,
                 "commit_ts": now,
+                "last_speech_ts": (
+                    self._last_speech_block_ts
+                    if self._last_speech_block_ts > 0.0
+                    else None
+                ),
             }
         )
         self.user_speaking = False

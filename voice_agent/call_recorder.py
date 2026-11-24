@@ -305,6 +305,8 @@ class CallRecorder:
                     m_parts.append(f"TTFA: {round(float(m['ttfa_server_ms']))} ms")
                 if m.get("ttfa_perceived_ms") is not None:
                     m_parts.append(f"Perceived: {round(float(m['ttfa_perceived_ms']))} ms")
+                if m.get("e2e_speech_to_audio_ms") is not None:
+                    m_parts.append(f"E2E: {round(float(m['e2e_speech_to_audio_ms']))} ms")
                 if m_parts:
                     metric_tag = f" ({' | '.join(m_parts)})"
             if role == "delegation":

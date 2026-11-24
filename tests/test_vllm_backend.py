@@ -1447,3 +1447,116 @@ def test_vllm_speculative_native_s2s_direct_tool_route_and_trailing_filler_promp
         assert "holding phrase" in trailing_section.lower()
     finally:
         engine.shutdown()
+
+
+def test_e2e_speech_to_audio_ms_metric_on_live_voice_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """`e2e_speech_to_audio_ms` measures from last speech block to browser `playback_started` (None on greeting)."""
+    monkeypatch.delenv("FLAMETREE_AGENT_TOKEN", raising=False)
+    omni = FakeAsyncOmni()
+    omni.router_decision = "DIRECT"
+    omni.asr_sequence = ["What is the monthly fee?", "", ""]
+    tok = FakeTokenizer()
+    calls_dir = tmp_path / "calls"
+
+    cfg = build_config(
+        backend="vllm",
+        language="en",
+        delegation_mode="selective_tool",
+        calls_dir=str(calls_dir),
+    )
+    engine = VllmOmniEngine(cfg.engine, omni_client=omni, tokenizer=tok)
+    engine.load()
+    try:
+        app = create_app(cfg, engine=engine, load_on_startup=False)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/call") as ws:
+                assert ws.receive_json() == {"type": "call_state", "state": "idle"}
+                ws.send_json({"type": "start_call", "language": "en"})
+
+                call_id = ""
+                t1_turn_id = ""
+                t1_perc_ev: dict[str, Any] | None = None
+                for _ in range(200):
+                    msg = ws.receive()
+                    if msg.get("text") is not None:
+                        ev = json.loads(msg["text"])
+                        t = ev.get("type")
+                        if t == "call_started":
+                            call_id = ev["call_id"]
+                        elif t == "assistant_turn_start" and not t1_turn_id:
+                            t1_turn_id = ev["turn_id"]
+                        elif t == "assistant_turn_end" and ev.get("turn_id") == t1_turn_id:
+                            ws.send_json(
+                                {
+                                    "type": "playback_started",
+                                    "turn_id": t1_turn_id,
+                                    "buffered_samples": 4800,
+                                }
+                            )
+                        elif t == "live_ttfa" and "ttfa_perceived_ms" in ev and ev.get("turn_id") == t1_turn_id:
+                            t1_perc_ev = ev
+                            break
+
+                assert call_id
+                assert t1_perc_ev is not None
+                assert t1_perc_ev.get("e2e_speech_to_audio_ms") is None
+                ws.send_json({"type": "playback_done", "played_samples": 4800})
+
+                # Stream speech block, pause 40 ms so endpoint_ms > 0, then silence to commit
+                ws.send_bytes(_pcm16_16k_speech_block(blocks=1))
+                time.sleep(0.04)
+                ws.send_bytes(b"\x00" * 20480)
+                ws.send_bytes(b"\x00" * 20480)
+
+                t2_turn_id = ""
+                t2_perc_ev: dict[str, Any] | None = None
+                for _ in range(200):
+                    msg = ws.receive()
+                    if msg.get("text") is not None:
+                        ev = json.loads(msg["text"])
+                        t = ev.get("type")
+                        if t == "assistant_turn_start" and ev.get("turn_id") != t1_turn_id:
+                            t2_turn_id = ev["turn_id"]
+                        elif t == "assistant_turn_end" and ev.get("turn_id") == t2_turn_id:
+                            ws.send_json(
+                                {
+                                    "type": "playback_started",
+                                    "turn_id": t2_turn_id,
+                                    "buffered_samples": 4800,
+                                }
+                            )
+                        elif t == "live_ttfa" and "ttfa_perceived_ms" in ev and ev.get("turn_id") == t2_turn_id:
+                            t2_perc_ev = ev
+                            break
+
+                assert t2_perc_ev is not None
+                assert t2_perc_ev["ttfa_perceived_ms"] is not None
+                assert t2_perc_ev.get("e2e_speech_to_audio_ms") is not None
+                assert t2_perc_ev["e2e_speech_to_audio_ms"] >= t2_perc_ev["ttfa_perceived_ms"]
+
+                ws.send_json({"type": "hang_up"})
+                for _ in range(40):
+                    msg = ws.receive()
+                    if msg.get("text") is not None:
+                        ev = json.loads(msg["text"])
+                        if ev.get("type") == "call_state" and ev.get("state") == "idle":
+                            break
+
+            detail = client.get(f"/api/calls/{call_id}").json()
+            assert detail["metadata"]["counts"]["error_count"] == 0
+            e2e_agg = detail["metrics"]["aggregates"]["e2e_speech_to_audio_ms"]
+            assert e2e_agg["count"] == 1
+            assert e2e_agg["last"] == t2_perc_ev["e2e_speech_to_audio_ms"]
+
+            ast_entries = [
+                e for e in detail["transcript"]["entries"] if e.get("role") == "assistant"
+            ]
+            assert ast_entries[0]["metrics"].get("e2e_speech_to_audio_ms") is None
+            assert ast_entries[1]["metrics"].get("e2e_speech_to_audio_ms") is not None
+            txt = (calls_dir / call_id / "transcript.txt").read_text(encoding="utf-8")
+            assert "E2E:" in txt
+    finally:
+        engine.shutdown()

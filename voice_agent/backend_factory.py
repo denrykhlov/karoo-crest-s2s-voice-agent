@@ -1,4 +1,4 @@
-"""Lazy backend factory selecting MLX (macOS) or vLLM-Omni (Linux/CUDA)."""
+"""Lazy backend factory selecting MLX (macOS), vLLM-Omni, or PyTorch/Transformers (CUDA)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ def build_engine(settings: EngineSettings) -> Any:
         from .vllm_backend import VllmOmniEngine
 
         return VllmOmniEngine(settings)
+    if settings.backend == "transformers":
+        from .transformers_backend import TransformersOmniEngine
+
+        return TransformersOmniEngine(settings)
     from .engine import Lfm3OmniEngine
 
     return Lfm3OmniEngine(settings)

@@ -54,6 +54,7 @@ class TurnDeliveryMetrics:
     ttfa_filler_ms: Optional[float] = None
     ttfa_answer_ms: Optional[float] = None
     ttfa_perceived_ms: Optional[float] = None
+    e2e_speech_to_audio_ms: Optional[float] = None
     delegation_ms: Optional[float] = None
     delegation_source: Optional[str] = None
     barge_in_cancel_ms: Optional[float] = None
@@ -76,6 +77,7 @@ class DeliveryStatsTracker:
     def __init__(self) -> None:
         self.turns: list[TurnDeliveryMetrics] = []
         self._pending_perceived_ms: dict[str, float] = {}
+        self._pending_e2e_ms: dict[str, float] = {}
         self._pending_barge_in: bool = False
         self._pending_barge_in_cancel_ms: Optional[float] = None
         self._pending_barge_in_ts: float = 0.0
@@ -85,6 +87,7 @@ class DeliveryStatsTracker:
     def reset(self) -> None:
         self.turns.clear()
         self._pending_perceived_ms.clear()
+        self._pending_e2e_ms.clear()
         self._pending_barge_in = False
         self._pending_barge_in_cancel_ms = None
         self._pending_barge_in_ts = 0.0
@@ -117,6 +120,9 @@ class DeliveryStatsTracker:
         pending_perc = self._pending_perceived_ms.pop(metrics.turn_id, None)
         if pending_perc is not None and metrics.ttfa_perceived_ms is None:
             metrics.ttfa_perceived_ms = pending_perc
+        pending_e2e = self._pending_e2e_ms.pop(metrics.turn_id, None)
+        if pending_e2e is not None and metrics.e2e_speech_to_audio_ms is None:
+            metrics.e2e_speech_to_audio_ms = pending_e2e
         if metrics.after_barge_in:
             if metrics.ttfa_perceived_ms is not None:
                 metrics.ttfa_after_barge_in_ms = metrics.ttfa_perceived_ms
@@ -125,19 +131,35 @@ class DeliveryStatsTracker:
         self.turns.append(metrics)
         return metrics
 
-    def update_perceived_ttfa(self, turn_id: str, perceived_ms: float) -> bool:
-        """Attach actual browser AudioWorklet audible onset latency to an active or finished turn."""
+    def update_perceived_ttfa(
+        self,
+        turn_id: str,
+        perceived_ms: float,
+        e2e_speech_to_audio_ms: Optional[float] = None,
+    ) -> bool:
+        """Attach browser AudioWorklet audible onset latency (and optional E2E speech-to-audio) to a turn."""
         rounded = round(max(0.0, float(perceived_ms)), 1)
+        rounded_e2e = (
+            round(max(0.0, float(e2e_speech_to_audio_ms)), 1)
+            if e2e_speech_to_audio_ms is not None
+            else None
+        )
         for turn in reversed(self.turns):
             if turn.turn_id == turn_id:
+                changed = False
                 if turn.ttfa_perceived_ms is None:
                     turn.ttfa_perceived_ms = rounded
                     if turn.after_barge_in:
                         turn.ttfa_after_barge_in_ms = rounded
-                    return True
-                return False
+                    changed = True
+                if rounded_e2e is not None and turn.e2e_speech_to_audio_ms is None:
+                    turn.e2e_speech_to_audio_ms = rounded_e2e
+                    changed = True
+                return changed
         if turn_id and turn_id not in self._pending_perceived_ms:
             self._pending_perceived_ms[turn_id] = rounded
+        if turn_id and rounded_e2e is not None and turn_id not in self._pending_e2e_ms:
+            self._pending_e2e_ms[turn_id] = rounded_e2e
         return False
 
     def summary(self, include_all_turns: bool = False) -> dict[str, Any]:
@@ -148,6 +170,7 @@ class DeliveryStatsTracker:
             "ttft_ms",
             "ttfa_server_ms",
             "ttfa_perceived_ms",
+            "e2e_speech_to_audio_ms",
             "ttfa_filler_ms",
             "ttfa_answer_ms",
             "delegation_ms",

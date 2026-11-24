@@ -10,6 +10,8 @@ import wave
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import numpy as np
+
 from .languages import get_language_profile
 
 TOOL_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
@@ -246,3 +248,125 @@ def strip_wav_header_if_present(raw: bytes) -> bytes:
             pos += chunk_size + (chunk_size & 1)
         return raw[44:]
     return raw
+
+
+def pcm16_to_float32(pcm16_bytes: bytes) -> np.ndarray:
+    """Decode little-endian 16-bit mono PCM bytes into float32 samples in [-1.0, 1.0]."""
+    if not pcm16_bytes:
+        return np.zeros((0,), dtype=np.float32)
+    return np.frombuffer(pcm16_bytes, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def float32_to_pcm16(audio: np.ndarray) -> bytes:
+    """Encode mono float32 samples in [-1.0, 1.0] to little-endian signed 16-bit PCM bytes."""
+    if audio.size == 0:
+        return b""
+    clipped = np.clip(audio.astype(np.float32, copy=False), -1.0, 1.0)
+    return (clipped * 32767.0).astype("<i2", copy=False).tobytes()
+
+
+def normalize_tool_calls_for_template(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure tool call `arguments` are Python dicts required by LFM3 chat template."""
+    normalized: list[dict[str, Any]] = []
+    for call in calls:
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        raw_args = fn.get("arguments")
+        if isinstance(raw_args, str):
+            try:
+                parsed = json.loads(raw_args) if raw_args.strip() else {}
+            except json.JSONDecodeError:
+                parsed = {}
+            args_dict = parsed if isinstance(parsed, dict) else {}
+        elif isinstance(raw_args, dict):
+            args_dict = dict(raw_args)
+        else:
+            args_dict = {}
+        normalized.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": str(fn.get("name") or ""),
+                    "arguments": args_dict,
+                },
+            }
+        )
+    return normalized
+
+
+def parse_router_query(raw_router_text: str, fallback_text: str) -> tuple[str, str]:
+    """Parse `DIRECT`, `TOOL`, or `DELEGATE: <question>` into `(kind, standalone_question)`."""
+    cleaned = clean_display_text(raw_router_text).strip()
+    upper = cleaned.upper()
+    if "DELEGATE" in upper:
+        idx = upper.find("DELEGATE")
+        tail = cleaned[idx + len("DELEGATE") :].lstrip(" :-\n\t")
+        return "delegate", (tail.strip() or fallback_text.strip() or "(banking question)")
+    if upper.startswith("TOOL") or re.search(r"\bTOOL\b", upper):
+        return "tool", ""
+    return "direct", ""
+
+
+def truncate_assistant_turn_for_barge_in(
+    turn: TurnRecord,
+    played_frames: int,
+    audio_out_token_id: int,
+    audio_eos_code: int,
+    im_end_id: int,
+    tokenizer: Any,
+) -> TurnRecord:
+    """Truncate an interrupted spoken assistant turn to the audio frames actually heard."""
+    if not turn.raw_token_ids or turn.raw_audio_codes is None:
+        text = turn.text.rstrip()
+        if text and not text.endswith("..."):
+            text = f"{text}..."
+        return TurnRecord(role="assistant", text=text)
+
+    codes = np.asarray(turn.raw_audio_codes, dtype=np.int32)
+    non_eos_total = int(np.sum(~np.any(codes == audio_eos_code, axis=-1)))
+    if non_eos_total == 0:
+        return TurnRecord(role="assistant", text=turn.text)
+
+    keep_frames = max(1, min(int(played_frames), non_eos_total))
+    new_token_ids: list[int] = []
+    kept_codes: list[np.ndarray] = []
+    kept_text_ids: list[int] = []
+
+    code_idx = 0
+    kept_non_eos = 0
+    for tok in turn.raw_token_ids:
+        if tok == audio_out_token_id:
+            if code_idx >= codes.shape[0]:
+                break
+            row = codes[code_idx]
+            code_idx += 1
+            if np.any(row == audio_eos_code):
+                continue
+            if kept_non_eos < keep_frames:
+                new_token_ids.append(tok)
+                kept_codes.append(row)
+                kept_non_eos += 1
+                if kept_non_eos >= keep_frames:
+                    break
+        elif tok == im_end_id:
+            continue
+        else:
+            new_token_ids.append(tok)
+            kept_text_ids.append(tok)
+
+    # Terminate speech cleanly with one EOS speech frame and <|im_end|>.
+    new_token_ids.append(audio_out_token_id)
+    kept_codes.append(np.full((12,), audio_eos_code, dtype=np.int32))
+    new_token_ids.append(im_end_id)
+
+    decoded = clean_display_text(
+        tokenizer.decode(kept_text_ids, skip_special_tokens=True)
+    )
+    if decoded and not decoded.endswith("..."):
+        decoded = f"{decoded}..."
+
+    return TurnRecord(
+        role="assistant",
+        text=decoded,
+        raw_token_ids=new_token_ids,
+        raw_audio_codes=np.stack(kept_codes, axis=0).astype(np.int32),
+    )

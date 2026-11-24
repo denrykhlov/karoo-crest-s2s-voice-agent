@@ -129,6 +129,11 @@ def run_server(config: VoiceAgentConfig, open_browser: bool = False) -> None:
             f"  vLLM   : native AsyncOmni (deploy_config={config.engine.vllm_deploy_config})",
             flush=True,
         )
+    elif config.engine.backend == "transformers":
+        print(
+            f"  Torch  : direct PyTorch/Transformers CUDA (device={config.engine.transformers_device}, attn={config.engine.transformers_attn_implementation})",
+            flush=True,
+        )
     if config.calls_dir:
         print(f"  Calls  : {Path(config.calls_dir).resolve()}", flush=True)
     print(f"  Studio : {url}\n", flush=True)

@@ -761,12 +761,16 @@ class VllmStreamingConversationSession:
         self.empty_chunk_streak = 0
         self.user_blocks_in_turn = 0
         self.listener.reset_window()
+        last_speech_ts = (
+            self._last_speech_block_ts if self._last_speech_block_ts > 0.0 else None
+        )
         events.append(
             {
                 "type": "user_turn_committed",
                 "turn_id": tid,
                 "text": final_text,
                 "endpoint_ms": round(endpoint_ms, 1) if endpoint_ms is not None else None,
+                "last_speech_ts": last_speech_ts,
             }
         )
 

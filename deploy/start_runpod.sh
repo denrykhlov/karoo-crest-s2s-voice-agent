@@ -3,6 +3,7 @@ set -euo pipefail
 
 MODEL_ID="${MODEL_ID:-LiquidAI/LFM3-Omni-2B}"
 MODEL_REVISION="${MODEL_REVISION:-21d75123f86c1f7ffb4bef1ea202710c4e7ebe67}"
+VOICE_BACKEND="${VOICE_BACKEND:-transformers}"
 APP_PORT="${APP_PORT:-8000}"
 DEFAULT_VOICE="${DEFAULT_VOICE:-naledi}"
 DEFAULT_LANG="${DEFAULT_LANG:-en}"
@@ -40,10 +41,9 @@ export VLLM_LOCAL_MODEL_DIR="${MODEL_LOCAL_DIR}"
 
 APP_ARGS=(
     /app/telesales_agent.py
-    --backend vllm
+    --backend "${VOICE_BACKEND}"
     --model "${MODEL_ID}"
     --model-revision "${MODEL_REVISION}"
-    --vllm-deploy-config "${DEPLOY_CONFIG}"
     --host 0.0.0.0
     --port "${APP_PORT}"
     --voice "${DEFAULT_VOICE}"
@@ -52,6 +52,10 @@ APP_ARGS=(
     --calls-dir "${CALLS_DIR}"
 )
 
+if [ "${VOICE_BACKEND}" = "vllm" ]; then
+    APP_ARGS+=(--vllm-deploy-config "${DEPLOY_CONFIG}")
+fi
+
 if [ -n "${FLAMETREE_AGENT_ID:-}" ]; then
     APP_ARGS+=(--flametree-agent-id "${FLAMETREE_AGENT_ID}")
 fi
@@ -59,5 +63,5 @@ if [ -n "${FLAMETREE_BASE_URL:-}" ]; then
     APP_ARGS+=(--flametree-base-url "${FLAMETREE_BASE_URL}")
 fi
 
-echo "[start_runpod] Starting Call Studio + native in-process AsyncOmni on 0.0.0.0:${APP_PORT} (calls_dir=${CALLS_DIR})"
+echo "[start_runpod] Starting Call Studio (--backend ${VOICE_BACKEND}) on 0.0.0.0:${APP_PORT} (calls_dir=${CALLS_DIR})"
 exec python3 "${APP_ARGS[@]}"

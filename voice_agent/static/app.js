@@ -483,7 +483,11 @@
           els.teleTtfaPerceived.textContent = val;
           els.kpiPerceived.textContent = val;
           if (msg.turn_id) {
-            updateTranscriptMetrics(msg.turn_id, { ttfa_perceived_ms: msg.ttfa_perceived_ms });
+            const patch = { ttfa_perceived_ms: msg.ttfa_perceived_ms };
+            if (msg.e2e_speech_to_audio_ms != null) {
+              patch.e2e_speech_to_audio_ms = msg.e2e_speech_to_audio_ms;
+            }
+            updateTranscriptMetrics(msg.turn_id, patch);
           }
         }
         break;
@@ -885,6 +889,9 @@
     if (m.ttfa_server_ms != null) parts.push(`TTFA: ${Math.round(Number(m.ttfa_server_ms))} ms`);
     if (m.ttfa_perceived_ms != null) {
       parts.push(`Perceived: ${Math.round(Number(m.ttfa_perceived_ms))} ms`);
+    }
+    if (m.e2e_speech_to_audio_ms != null) {
+      parts.push(`E2E: ${Math.round(Number(m.e2e_speech_to_audio_ms))} ms`);
     }
     return parts;
   }

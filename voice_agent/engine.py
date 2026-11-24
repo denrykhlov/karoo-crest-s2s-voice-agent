@@ -30,73 +30,8 @@ from .protocol import (
     clean_display_text,
     parse_tool_calls,
     render_tool_calls,
+    truncate_assistant_turn_for_barge_in,
 )
-
-
-def truncate_assistant_turn_for_barge_in(
-    turn: TurnRecord,
-    played_frames: int,
-    audio_out_token_id: int,
-    audio_eos_code: int,
-    im_end_id: int,
-    tokenizer: Any,
-) -> TurnRecord:
-    """Truncate an interrupted spoken assistant turn to the audio frames actually heard."""
-    if not turn.raw_token_ids or turn.raw_audio_codes is None:
-        text = turn.text.rstrip()
-        if text and not text.endswith("..."):
-            text = f"{text}..."
-        return TurnRecord(role="assistant", text=text)
-
-    codes = np.asarray(turn.raw_audio_codes, dtype=np.int32)
-    non_eos_total = int(np.sum(~np.any(codes == audio_eos_code, axis=-1)))
-    if non_eos_total == 0:
-        return TurnRecord(role="assistant", text=turn.text)
-
-    keep_frames = max(1, min(int(played_frames), non_eos_total))
-    new_token_ids: list[int] = []
-    kept_codes: list[np.ndarray] = []
-    kept_text_ids: list[int] = []
-
-    code_idx = 0
-    kept_non_eos = 0
-    for tok in turn.raw_token_ids:
-        if tok == audio_out_token_id:
-            if code_idx >= codes.shape[0]:
-                break
-            row = codes[code_idx]
-            code_idx += 1
-            if np.any(row == audio_eos_code):
-                continue
-            if kept_non_eos < keep_frames:
-                new_token_ids.append(tok)
-                kept_codes.append(row)
-                kept_non_eos += 1
-                if kept_non_eos >= keep_frames:
-                    break
-        elif tok == im_end_id:
-            continue
-        else:
-            new_token_ids.append(tok)
-            kept_text_ids.append(tok)
-
-    # Terminate speech cleanly with one EOS speech frame and <|im_end|>.
-    new_token_ids.append(audio_out_token_id)
-    kept_codes.append(np.full((12,), audio_eos_code, dtype=np.int32))
-    new_token_ids.append(im_end_id)
-
-    decoded = clean_display_text(
-        tokenizer.decode(kept_text_ids, skip_special_tokens=True)
-    )
-    if decoded and not decoded.endswith("..."):
-        decoded = f"{decoded}..."
-
-    return TurnRecord(
-        role="assistant",
-        text=decoded,
-        raw_token_ids=new_token_ids,
-        raw_audio_codes=np.stack(kept_codes, axis=0).astype(np.int32),
-    )
 
 
 class Lfm3OmniEngine:

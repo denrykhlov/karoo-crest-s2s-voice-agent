@@ -92,9 +92,11 @@ class FlametreeSettings:
 class EngineSettings:
     """Inference, pure-S2S always-streaming, and 5-minute call management settings."""
 
-    backend: str = "mlx"  # "mlx" | "vllm"
+    backend: str = "mlx"  # "mlx" | "vllm" | "transformers"
     model_id: str = "LiquidAI/LFM3-Omni-2B-MLX-8bit"
     model_revision: str = "21d75123f86c1f7ffb4bef1ea202710c4e7ebe67"
+    transformers_device: str = "auto"  # "auto" | "cuda" | "cpu"
+    transformers_attn_implementation: str = "sdpa"  # "sdpa" | "flash_attention_2" | "eager"
     vllm_deploy_config: str = "deploy/lfm3_omni_runpod.yaml"
     vllm_max_audio_per_prompt: int = 8
     vllm_base_url: str = ""
@@ -237,7 +239,11 @@ class VoiceAgentConfig:
             "batch_parallel_mode": (
                 "vllm_continuous_batch"
                 if self.engine.backend == "vllm"
-                else "heterogeneous_b2"
+                else (
+                    "transformers_direct_cuda"
+                    if self.engine.backend == "transformers"
+                    else "heterogeneous_b2"
+                )
             ),
             "default_turn_patience": self.default_turn_patience,
             "target_call_duration_sec": self.target_call_duration_sec,

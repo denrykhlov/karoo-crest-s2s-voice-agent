@@ -92,6 +92,8 @@ class CallSession:
         self._turn_counter: int = 0
         self._last_endpoint_ms: Optional[float] = None
         self._turn_start_wall: dict[str, float] = {}
+        self._last_speech_end_wall: Optional[float] = None
+        self._turn_speech_end_wall: dict[str, float] = {}
 
     @staticmethod
     def _empty_crm_state() -> dict[str, Any]:
@@ -463,28 +465,37 @@ class CallSession:
             turn_id = str(msg.get("turn_id") or "")
             t0 = self._turn_start_wall.get(turn_id)
             if t0 is not None:
-                perceived_ms = (time.perf_counter() - t0) * 1000.0
+                now = time.perf_counter()
+                perceived_ms = (now - t0) * 1000.0
                 rounded_perc = round(perceived_ms, 1)
+                t_speech = self._turn_speech_end_wall.get(turn_id)
+                e2e_ms = (now - t_speech) * 1000.0 if t_speech is not None else None
+                rounded_e2e = round(e2e_ms, 1) if e2e_ms is not None else None
                 if self.recorder is not None:
                     self.recorder.record_event(
                         "playback_started",
                         {
                             "turn_id": turn_id,
                             "ttfa_perceived_ms": rounded_perc,
+                            "e2e_speech_to_audio_ms": rounded_e2e,
                             "buffered_samples": msg.get("buffered_samples"),
                         },
                     )
-                    self.recorder.update_transcript_metrics(
-                        turn_id, {"ttfa_perceived_ms": rounded_perc}
-                    )
-                await self._send_json(
-                    {
-                        "type": "live_ttfa",
-                        "turn_id": turn_id,
-                        "ttfa_perceived_ms": rounded_perc,
-                    }
-                )
-                if self.stats.update_perceived_ttfa(turn_id, perceived_ms):
+                    metrics_patch: dict[str, Any] = {"ttfa_perceived_ms": rounded_perc}
+                    if rounded_e2e is not None:
+                        metrics_patch["e2e_speech_to_audio_ms"] = rounded_e2e
+                    self.recorder.update_transcript_metrics(turn_id, metrics_patch)
+                live_payload: dict[str, Any] = {
+                    "type": "live_ttfa",
+                    "turn_id": turn_id,
+                    "ttfa_perceived_ms": rounded_perc,
+                }
+                if rounded_e2e is not None:
+                    live_payload["e2e_speech_to_audio_ms"] = rounded_e2e
+                await self._send_json(live_payload)
+                if self.stats.update_perceived_ttfa(
+                    turn_id, perceived_ms, e2e_speech_to_audio_ms=e2e_ms
+                ):
                     await self._emit_delivery_stats()
 
         elif kind == "playback_progress":
@@ -626,6 +637,7 @@ class CallSession:
             elif et == "user_turn_committed":
                 tid = ev["turn_id"]
                 self._last_endpoint_ms = ev.get("endpoint_ms")
+                self._last_speech_end_wall = ev.get("last_speech_ts")
                 if self.recorder is not None:
                     self.recorder.record_event(
                         "user_turn_committed",
@@ -823,6 +835,8 @@ class CallSession:
         self._turn_counter = 0
         self._last_endpoint_ms = None
         self._turn_start_wall.clear()
+        self._last_speech_end_wall = None
+        self._turn_speech_end_wall.clear()
         self._last_context_stats = {}
 
         if self.config.calls_dir:
@@ -953,6 +967,7 @@ class CallSession:
                 if not self.call_active or cancel_ev.is_set():
                     return
                 self._last_endpoint_ms = 0.0
+                self._last_speech_end_wall = time.perf_counter()
                 pipeline = self._ensure_pipeline()
                 events = await asyncio.wrap_future(
                     self.engine.run_on_worker(pipeline.flush_ptt_audio, raw_pcm),
@@ -1006,6 +1021,7 @@ class CallSession:
                 if not self.call_active or cancel_ev.is_set():
                     return
                 self._last_endpoint_ms = 0.0
+                self._last_speech_end_wall = time.perf_counter()
                 pipeline = self._ensure_pipeline()
                 await asyncio.wrap_future(
                     self.engine.run_on_worker(pipeline.append_text_user_turn, text),
@@ -1047,6 +1063,7 @@ class CallSession:
             if not self.call_active or self._cancel_event.is_set():
                 return
             self._last_endpoint_ms = None
+            self._last_speech_end_wall = None
             pipeline = self._ensure_pipeline()
             greeting_trigger = build_localized_greeting_trigger(
                 lang_code=self.language,
@@ -1335,6 +1352,7 @@ class CallSession:
                 "ttft_ms": recorded_int.ttft_ms,
                 "ttfa_server_ms": recorded_int.ttfa_server_ms,
                 "ttfa_perceived_ms": recorded_int.ttfa_perceived_ms,
+                "e2e_speech_to_audio_ms": recorded_int.e2e_speech_to_audio_ms,
                 "route_decision": recorded_int.route_decision,
             }
 
@@ -1550,6 +1568,10 @@ class CallSession:
         self._turn_counter += 1
         t_turn_start = time.perf_counter()
         self._turn_start_wall[turn_id] = t_turn_start
+        speech_end_ts = self._last_speech_end_wall
+        self._last_speech_end_wall = None
+        if speech_end_ts is not None:
+            self._turn_speech_end_wall[turn_id] = speech_end_ts
         self._played_samples_24k = 0
         self._last_assistant_turn = None
         self._last_assistant_turn_id = turn_id
@@ -2091,6 +2113,7 @@ class CallSession:
             "ttft_ms": turn_metrics.ttft_ms,
             "ttfa_server_ms": turn_metrics.ttfa_server_ms,
             "ttfa_perceived_ms": turn_metrics.ttfa_perceived_ms,
+            "e2e_speech_to_audio_ms": turn_metrics.e2e_speech_to_audio_ms,
             "ttfa_filler_ms": turn_metrics.ttfa_filler_ms,
             "ttfa_answer_ms": turn_metrics.ttfa_answer_ms,
             "delegation_ms": turn_metrics.delegation_ms,

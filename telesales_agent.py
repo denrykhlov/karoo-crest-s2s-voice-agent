@@ -487,14 +487,16 @@ def build_config(
     record_call_audio: bool = True,
 ) -> VoiceAgentConfig:
     resolved_backend = (backend or os.environ.get("VOICE_BACKEND", "mlx")).strip().lower()
-    if resolved_backend not in ("mlx", "vllm"):
-        raise ValueError(f"Unsupported backend {resolved_backend!r}; expected 'mlx' or 'vllm'.")
+    if resolved_backend not in ("mlx", "vllm", "transformers"):
+        raise ValueError(
+            f"Unsupported backend {resolved_backend!r}; expected 'mlx', 'vllm', or 'transformers'."
+        )
     resolved_model_id = (
         model_id
         or os.environ.get("MODEL_ID", "").strip()
         or (
             "LiquidAI/LFM3-Omni-2B"
-            if resolved_backend == "vllm"
+            if resolved_backend in ("vllm", "transformers")
             else "LiquidAI/LFM3-Omni-2B-MLX-8bit"
         )
     )
@@ -588,13 +590,13 @@ def main() -> None:
     parser.add_argument(
         "--backend",
         default=os.environ.get("VOICE_BACKEND", "mlx"),
-        choices=["mlx", "vllm"],
-        help="Inference backend: 'mlx' (macOS Apple Silicon) or 'vllm' (native vLLM-Omni AsyncOmni)",
+        choices=["mlx", "vllm", "transformers"],
+        help="Inference backend: 'mlx' (Apple Silicon), 'vllm' (vLLM-Omni AsyncOmni), or 'transformers' (direct PyTorch CUDA)",
     )
     parser.add_argument(
         "--model-revision",
         default=None,
-        help="HuggingFace model revision for --backend vllm",
+        help="HuggingFace model revision for --backend vllm or transformers",
     )
     parser.add_argument(
         "--vllm-deploy-config",
